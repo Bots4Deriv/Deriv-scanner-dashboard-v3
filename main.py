@@ -13,6 +13,7 @@ import pytz
 from collections import deque
 import uuid
 import logging
+import math
 
 # Setup logging
 logging.basicConfig(
@@ -92,8 +93,12 @@ VOLATILITY_LOOKBACK = get_env_int("VOLATILITY_LOOKBACK", 6)
 RANGE_LOOKBACK = get_env_int("RANGE_LOOKBACK", 30)
 MIN_CONFIDENCE_THRESHOLD = get_env_float("MIN_CONFIDENCE_THRESHOLD", 60.0)
 
-# NEW: Trade monitoring timeout (seconds)
-TRADE_MONITOR_TIMEOUT = get_env_int("TRADE_MONITOR_TIMEOUT", 600)  # 10 minutes max
+# NEW: Stake precision settings
+MIN_STAKE = get_env_float("MIN_STAKE", 0.35)  # Deriv minimum
+MAX_STAKE = get_env_float("MAX_STAKE", 50000.0)  # Deriv maximum
+
+# Trade monitoring
+TRADE_MONITOR_TIMEOUT = get_env_int("TRADE_MONITOR_TIMEOUT", 600)
 
 # Notifications
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
@@ -162,6 +167,27 @@ last_signal_trade_time = None
 SIGNAL_EXPIRY_SECONDS = 30
 
 # =========================
+# STAKE CALCULATION - FIXED FOR DERIV PRECISION
+# =========================
+def format_stake(amount):
+    """
+    Format stake to exactly 2 decimal places for Deriv.
+    Deriv requires: 0.35 minimum, 50000.00 maximum, exactly 2 decimals.
+    """
+    # Round to 2 decimal places
+    formatted = round(float(amount), 2)
+    
+    # Enforce minimum and maximum
+    formatted = max(MIN_STAKE, min(MAX_STAKE, formatted))
+    
+    # Ensure it's a valid number
+    if formatted <= 0 or math.isnan(formatted) or math.isinf(formatted):
+        logger.error(f"Invalid stake calculated: {amount}, using minimum {MIN_STAKE}")
+        return MIN_STAKE
+    
+    return formatted
+
+# =========================
 # RISK MANAGER
 # =========================
 class RiskManager:
@@ -213,16 +239,36 @@ class RiskManager:
         return True, "OK"
 
     def calculate_stake(self):
+        """
+        Calculate stake with proper 2-decimal precision for Deriv.
+        """
         balance = bot_status.get("balance", 0)
-        max_by_balance = (balance * MAX_STAKE_PERCENT) / 100
         
+        # Calculate max based on percentage
+        max_by_percent = (balance * MAX_STAKE_PERCENT) / 100
+        
+        # Start with base stake
+        stake = STAKE_AMOUNT
+        
+        # Apply martingale if enabled
         if MARTINGALE_ENABLED and martingale_state["consecutive_losses"] > 0:
             step = min(martingale_state["consecutive_losses"], MARTINGALE_MAX_STEPS)
-            stake = STAKE_AMOUNT * (MARTINGALE_MULTIPLIER ** step)
-            stake = min(stake, max_by_balance, STAKE_AMOUNT * 10)
-            return round(stake, 2)
+            multiplier = MARTINGALE_MULTIPLIER ** step
+            stake = STAKE_AMOUNT * multiplier
+            logger.info(f"🎲 Martingale step {step}: ${stake:.2f} (x{multiplier})")
         
-        return round(min(STAKE_AMOUNT, max_by_balance), 2)
+        # Cap at percentage limit
+        stake = min(stake, max_by_percent)
+        
+        # Hard cap at 10x base for safety
+        stake = min(stake, STAKE_AMOUNT * 10)
+        
+        # Format to exactly 2 decimals for Deriv
+        final_stake = format_stake(stake)
+        
+        logger.debug(f"Stake calculation: balance=${balance:.2f}, max%=${max_by_percent:.2f}, raw=${stake:.4f}, final=${final_stake:.2f}")
+        
+        return final_stake
 
     def update_after_trade(self, profit_loss):
         daily_stats["trades"] += 1
@@ -299,9 +345,16 @@ async def place_trade(contract_type, signal_type="UNKNOWN", confidence=0):
         logger.info(f"⛔ Signal too recent ({int(now - last_signal_trade_time)}s ago)")
         return None
     
+    # Calculate stake with proper formatting
     stake = risk_manager.calculate_stake()
-    if stake <= 0:
-        logger.error("⛔ Invalid stake amount")
+    
+    # Validate stake
+    if stake < MIN_STAKE:
+        logger.error(f"⛔ Stake ${stake:.2f} below minimum ${MIN_STAKE:.2f}")
+        return None
+    
+    if stake > MAX_STAKE:
+        logger.error(f"⛔ Stake ${stake:.2f} above maximum ${MAX_STAKE:.2f}")
         return None
     
     ws = await get_trading_ws()
@@ -313,11 +366,14 @@ async def place_trade(contract_type, signal_type="UNKNOWN", confidence=0):
     
     try:
         async with trading_ws_lock:
+            # Ensure stake is exactly 2 decimals for Deriv
+            stake_for_deriv = round(stake, 2)
+            
             contract = {
                 "buy": 1,
-                "price": stake,
+                "price": stake_for_deriv,  # Must be exactly 2 decimals
                 "parameters": {
-                    "amount": stake,
+                    "amount": stake_for_deriv,  # Must be exactly 2 decimals
                     "basis": "stake",
                     "contract_type": contract_type,
                     "currency": "USD",
@@ -327,6 +383,8 @@ async def place_trade(contract_type, signal_type="UNKNOWN", confidence=0):
                 }
             }
             
+            logger.info(f"📤 Sending buy request: ${stake_for_deriv:.2f} {contract_type}")
+            
             await ws.send(json.dumps(contract))
             response = await asyncio.wait_for(ws.recv(), timeout=10.0)
             data = json.loads(response)
@@ -335,8 +393,7 @@ async def place_trade(contract_type, signal_type="UNKNOWN", confidence=0):
                 contract_id = data["buy"]["contract_id"]
                 actual_stake = float(data["buy"]["buy_price"])
                 
-                # Get contract details
-                contract_details = data["buy"]
+                logger.info(f"📥 Buy confirmed: ${actual_stake:.2f} | Contract: {contract_id}")
                 
                 trade_info = {
                     "id": trade_id,
@@ -344,7 +401,7 @@ async def place_trade(contract_type, signal_type="UNKNOWN", confidence=0):
                     "type": contract_type,
                     "signal_type": signal_type,
                     "confidence": confidence,
-                    "stake": actual_stake,
+                    "stake": round(actual_stake, 2),  # Ensure 2 decimals
                     "entry_price": bot_status["last_price"],
                     "symbol": SYMBOL,
                     "start_time": get_eat_timestamp(),
@@ -379,6 +436,8 @@ async def place_trade(contract_type, signal_type="UNKNOWN", confidence=0):
             else:
                 error = data.get("error", {}).get("message", "Unknown")
                 logger.error(f"❌ Buy failed: {error}")
+                if "stake" in error.lower() or "amount" in error.lower():
+                    logger.error(f"   Stake attempted: ${stake_for_deriv:.2f}")
                 return None
                 
     except Exception as e:
@@ -386,22 +445,14 @@ async def place_trade(contract_type, signal_type="UNKNOWN", confidence=0):
         return None
 
 async def monitor_trade_with_timeout(trade_id, contract_id):
-    """
-    Monitor trade with multiple fallback strategies:
-    1. Try WebSocket subscription
-    2. Fallback to polling if WebSocket fails
-    3. Force close after timeout
-    """
     start_time = time.time()
     result = None
     
-    # Try WebSocket monitoring first
     try:
         result = await monitor_trade_websocket(trade_id, contract_id, start_time)
     except Exception as e:
         logger.error(f"❌ WebSocket monitor failed for {trade_id}: {e}")
     
-    # If WebSocket failed or timed out, try polling
     if not result:
         logger.warning(f"⚠️ Falling back to polling for {trade_id}")
         try:
@@ -409,13 +460,11 @@ async def monitor_trade_with_timeout(trade_id, contract_id):
         except Exception as e:
             logger.error(f"❌ Polling failed for {trade_id}: {e}")
     
-    # If still no result, force close the trade tracking
     if not result:
         logger.error(f"❌ Could not determine result for {trade_id}, forcing close")
         await force_close_trade(trade_id, "UNKNOWN")
 
 async def monitor_trade_websocket(trade_id, contract_id, start_time):
-    """Monitor via WebSocket subscription"""
     ws = None
     url = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
     
@@ -425,9 +474,7 @@ async def monitor_trade_websocket(trade_id, contract_id, start_time):
         if DERIV_API_TOKEN:
             await ws.send(json.dumps({"authorize": DERIV_API_TOKEN}))
             auth_response = await asyncio.wait_for(ws.recv(), timeout=5.0)
-            logger.debug(f"Monitor auth: {auth_response[:100]}...")
         
-        # Subscribe to contract updates
         subscribe_msg = {
             "proposal_open_contract": 1,
             "contract_id": contract_id,
@@ -444,22 +491,17 @@ async def monitor_trade_websocket(trade_id, contract_id, start_time):
                 if "proposal_open_contract" in data:
                     contract = data["proposal_open_contract"]
                     
-                    # Log contract status for debugging
                     is_sold = contract.get("is_sold", False)
                     is_expired = contract.get("is_expired", False)
                     status = contract.get("status", "unknown")
                     
-                    logger.debug(f"Trade {trade_id} status: sold={is_sold}, expired={is_expired}, status={status}")
-                    
-                    # Update current profit
                     current_profit = float(contract.get("profit", 0))
                     current_spot = float(contract.get("current_spot", 0))
                     
                     if trade_id in active_trades:
-                        active_trades[trade_id]["current_profit"] = current_profit
+                        active_trades[trade_id]["current_profit"] = round(current_profit, 2)
                         active_trades[trade_id]["current_price"] = current_spot
                     
-                    # Check if trade is complete
                     if is_sold or is_expired or status == "sold":
                         profit = float(contract.get("profit", 0))
                         exit_tick = contract.get("exit_tick") or contract.get("current_spot")
@@ -468,11 +510,10 @@ async def monitor_trade_websocket(trade_id, contract_id, start_time):
                         return True
                         
             except asyncio.TimeoutError:
-                # Check if trade duration has passed
                 elapsed = time.time() - start_time
                 expected_seconds = TRADE_DURATION * 60 if TRADE_DURATION_UNIT == "m" else TRADE_DURATION
                 
-                if elapsed > expected_seconds + 30:  # Grace period
+                if elapsed > expected_seconds + 30:
                     logger.warning(f"⏱️ Trade {trade_id} timeout after {elapsed}s")
                     return False
                 continue
@@ -492,27 +533,24 @@ async def monitor_trade_websocket(trade_id, contract_id, start_time):
             await ws.close()
 
 async def monitor_trade_polling(trade_id, contract_id, start_time):
-    """Fallback: Poll for contract status via API"""
-    poll_interval = 5  # seconds
-    max_attempts = 120  # 10 minutes max
+    poll_interval = 5
+    max_attempts = 120
     
     for attempt in range(max_attempts):
         if time.time() - start_time > TRADE_MONITOR_TIMEOUT:
             break
             
         try:
-            # Create new connection for each poll
             url = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
             async with websockets.connect(url, ping_timeout=10) as ws:
                 if DERIV_API_TOKEN:
                     await ws.send(json.dumps({"authorize": DERIV_API_TOKEN}))
                     await asyncio.wait_for(ws.recv(), timeout=5.0)
                 
-                # Request contract status (not subscribe)
                 status_msg = {
                     "proposal_open_contract": 1,
                     "contract_id": contract_id,
-                    "subscribe": 0  # One-time request
+                    "subscribe": 0
                 }
                 await ws.send(json.dumps(status_msg))
                 
@@ -529,9 +567,8 @@ async def monitor_trade_polling(trade_id, contract_id, start_time):
                         await finalize_trade(trade_id, profit, exit_tick, "polling")
                         return True
                     
-                    # Update running profit
                     if trade_id in active_trades:
-                        active_trades[trade_id]["current_profit"] = float(contract.get("profit", 0))
+                        active_trades[trade_id]["current_profit"] = round(float(contract.get("profit", 0)), 2)
                         
         except Exception as e:
             logger.debug(f"Poll attempt {attempt} failed: {e}")
@@ -541,18 +578,15 @@ async def monitor_trade_polling(trade_id, contract_id, start_time):
     return False
 
 async def force_close_trade(trade_id, result_status):
-    """Force close a trade when monitoring fails"""
     if trade_id not in active_trades:
         return
     
     trade = active_trades[trade_id]
-    
-    # Estimate result based on current price vs entry
     entry = trade.get("entry_price", 0)
     current = bot_status.get("last_price", entry)
     
     if trade.get("type") == "CALL":
-        estimated_profit = -trade.get("stake", 0) * 0.1  # Assume small loss
+        estimated_profit = -trade.get("stake", 0) * 0.1
     else:
         estimated_profit = -trade.get("stake", 0) * 0.1
     
@@ -560,7 +594,7 @@ async def force_close_trade(trade_id, result_status):
     
     trade.update({
         "status": result_status,
-        "profit": estimated_profit,
+        "profit": round(estimated_profit, 2),
         "exit_price": current,
         "exit_time": get_eat_timestamp(),
         "forced_close": True
@@ -573,7 +607,6 @@ async def force_close_trade(trade_id, result_status):
         del active_trades[trade_id]
 
 async def finalize_trade(trade_id, profit, exit_tick, method):
-    """Finalize trade and update statistics"""
     if trade_id not in active_trades:
         logger.warning(f"⚠️ Trade {trade_id} not found in active_trades")
         return
@@ -581,10 +614,15 @@ async def finalize_trade(trade_id, profit, exit_tick, method):
     status = "WIN" if profit > 0 else "LOSS"
     trade = active_trades[trade_id]
     
+    # Ensure all monetary values are 2 decimals
+    profit = round(float(profit), 2)
+    entry = round(float(trade.get("entry_price", 0)), 3)
+    exit_p = round(float(exit_tick) if exit_tick else entry, 3)
+    
     trade.update({
         "status": status,
         "profit": profit,
-        "exit_price": float(exit_tick) if exit_tick else trade.get("entry_price"),
+        "exit_price": exit_p,
         "exit_time": get_eat_timestamp(),
         "monitor_method": method
     })
@@ -594,8 +632,6 @@ async def finalize_trade(trade_id, profit, exit_tick, method):
     
     emoji = "✅" if profit > 0 else "❌"
     signal_type = trade.get("signal_type", "UNKNOWN")
-    entry = trade.get("entry_price", 0)
-    exit_p = trade.get("exit_price", 0)
     
     msg = (f"{emoji} TRADE CLOSED ({method})\n"
            f"Signal: {signal_type}\n"
@@ -611,7 +647,7 @@ async def finalize_trade(trade_id, profit, exit_tick, method):
     del active_trades[trade_id]
 
 # =========================
-# SIGNAL ANALYSIS (unchanged from previous)
+# SIGNAL ANALYSIS
 # =========================
 def analyze_signals_directional(prices_list):
     if len(prices_list) < 30:
@@ -780,7 +816,8 @@ async def stream_ticks():
     
     logger.info("=" * 60)
     logger.info(f"🚀 BOT STARTED | Symbol: {SYMBOL} | Trading: {'ON' if AUTO_TRADE_ENABLED else 'OFF'}")
-    logger.info(f"Min Confidence: {MIN_CONFIDENCE_THRESHOLD}% | Timeout: {TRADE_MONITOR_TIMEOUT}s")
+    logger.info(f"Stake: ${STAKE_AMOUNT:.2f} | Min: ${MIN_STAKE:.2f} | Max%: {MAX_STAKE_PERCENT:.1f}%")
+    logger.info(f"Daily Loss Limit: ${MAX_DAILY_LOSS:.2f} | Profit Target: ${MAX_DAILY_PROFIT:.2f}")
     logger.info("=" * 60)
 
     while not shutdown_event.is_set():
