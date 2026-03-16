@@ -2,6 +2,7 @@ import os
 import logging
 
 class Config:
+    API_TOKEN = os.getenv("DERIV_API_TOKEN", "")
     APP_ID = os.getenv("DERIV_APP_ID", "1089")
     TIMEFRAME = int(os.getenv("TIMEFRAME", "60"))
     CANDLE_COUNT = int(os.getenv("CANDLE_COUNT", "80"))
