@@ -36,55 +36,78 @@ def get_eat_timestamp():
 def get_eat_clock():
     return get_eat_time().strftime("%H:%M:%S")
 
-# Railway & Core Config
-PORT = int(os.getenv("PORT", "8080"))
-AUTO_TRADE_ENABLED = os.getenv("AUTO_TRADE_ENABLED", "false").lower() == "true"
-DERIV_API_TOKEN = os.getenv("DERIV_API_TOKEN")
+# =========================
+# RAILWAY CONFIG - ALL WITH SAFE DEFAULTS
+# =========================
+
+def get_env_int(name, default):
+    """Safely get integer env var with default"""
+    try:
+        return int(os.getenv(name, str(default)))
+    except (ValueError, TypeError):
+        return default
+
+def get_env_float(name, default):
+    """Safely get float env var with default"""
+    try:
+        return float(os.getenv(name, str(default)))
+    except (ValueError, TypeError):
+        return default
+
+def get_env_bool(name, default=False):
+    """Safely get boolean env var"""
+    val = os.getenv(name, str(default).lower())
+    return val.lower() in ('true', '1', 'yes', 'on')
+
+# Core settings
+PORT = get_env_int("PORT", 8080)
+AUTO_TRADE_ENABLED = get_env_bool("AUTO_TRADE_ENABLED", False)
+DERIV_API_TOKEN = os.getenv("DERIV_API_TOKEN", "")
 DERIV_APP_ID = os.getenv("DERIV_APP_ID", "1089")
 SYMBOL = os.getenv("SYMBOL", "R_25")
 
-# Risk Settings
-STAKE_AMOUNT = float(os.getenv("STAKE_AMOUNT", "1.0"))
-MAX_DAILY_LOSS = float(os.getenv("MAX_DAILY_LOSS", "50.0"))
-MAX_DAILY_PROFIT = float(os.getenv("MAX_DAILY_PROFIT", "100.0"))
-MAX_TRADES_PER_DAY = int(os.getenv("MAX_TRADES_PER_DAY", "20"))
-MAX_CONCURRENT_TRADES = int(os.getenv("MAX_CONCURRENT_TRADES", "3"))
-MAX_STAKE_PERCENT = float(os.getenv("MAX_STAKE_PERCENT", "5.0"))
+# Risk settings
+STAKE_AMOUNT = get_env_float("STAKE_AMOUNT", 1.0)
+MAX_DAILY_LOSS = get_env_float("MAX_DAILY_LOSS", 50.0)
+MAX_DAILY_PROFIT = get_env_float("MAX_DAILY_PROFIT", 100.0)
+MAX_TRADES_PER_DAY = get_env_int("MAX_TRADES_PER_DAY", 20)
+MAX_CONCURRENT_TRADES = get_env_int("MAX_CONCURRENT_TRADES", 3)
+MAX_STAKE_PERCENT = get_env_float("MAX_STAKE_PERCENT", 5.0)
 
 # Martingale
-MARTINGALE_ENABLED = os.getenv("MARTINGALE_ENABLED", "false").lower() == "true"
-MARTINGALE_MAX_STEPS = int(os.getenv("MARTINGALE_MAX_STEPS", "3"))
-MARTINGALE_MULTIPLIER = float(os.getenv("MARTINGALE_MULTIPLIER", "2.0"))
+MARTINGALE_ENABLED = get_env_bool("MARTINGALE_ENABLED", False)
+MARTINGALE_MAX_STEPS = get_env_int("MARTINGALE_MAX_STEPS", 3)
+MARTINGALE_MULTIPLIER = get_env_float("MARTINGALE_MULTIPLIER", 2.0)
 
-# Trade Settings
-TRADE_DURATION = int(os.getenv("TRADE_DURATION", "5"))
+# Trade settings
+TRADE_DURATION = get_env_int("TRADE_DURATION", 5)
 TRADE_DURATION_UNIT = os.getenv("TRADE_DURATION_UNIT", "m")
-COOLDOWN_AFTER_LOSS = int(os.getenv("COOLDOWN_AFTER_LOSS", "3"))
-COOLDOWN_AFTER_WIN = int(os.getenv("COOLDOWN_AFTER_WIN", "1"))
+COOLDOWN_AFTER_LOSS = get_env_int("COOLDOWN_AFTER_LOSS", 3)
+COOLDOWN_AFTER_WIN = get_env_int("COOLDOWN_AFTER_WIN", 1)
 
-# Signal Settings - NOW DIRECTIONAL
-MAX_TICKS = int(os.getenv("MAX_TICKS", "200"))
+# Signal settings - ALL WITH DEFAULTS TO AVOID BUILD ERRORS
+MAX_TICKS = get_env_int("MAX_TICKS", 200)
 
-# Momentum Settings - Trade WITH momentum direction
-MOMENTUM_THRESHOLD = int(os.getenv("MOMENTUM_THRESHOLD", "8"))  # Min up/down moves to trigger
-MOMENTUM_LOOKBACK = int(os.getenv("MOMENTUM_LOOKBACK", "15"))  # Ticks to analyze
+# Momentum settings
+MOMENTUM_THRESHOLD = get_env_int("MOMENTUM_THRESHOLD", 8)
+MOMENTUM_LOOKBACK = get_env_int("MOMENTUM_LOOKBACK", 15)
 
-# Stretch Settings - Trade WITH stretch direction (breakout)
-STRETCH_THRESHOLD = float(os.getenv("STRETCH_THRESHOLD", "0.5"))  # Min distance from average
-STRETCH_LOOKBACK = int(os.getenv("STRETCH_LOOKBACK", "10"))  # Average period
+# Stretch settings  
+STRETCH_THRESHOLD = get_env_float("STRETCH_THRESHOLD", 0.5)
+STRETCH_LOOKBACK = get_env_int("STRETCH_LOOKBACK", 10)
 
-# Volatility Settings - Trade WITH volatility direction (breakout)
-VOLATILITY_THRESHOLD = float(os.getenv("VOLATILITY_THRESHOLD", "0.6"))  # Min spike size
-VOLATILITY_LOOKBACK = int(os.getenv("VOLATILITY_LOOKBACK", "6"))  # Recent ticks to check
+# Volatility settings
+VOLATILITY_THRESHOLD = get_env_float("VOLATILITY_THRESHOLD", 0.6)
+VOLATILITY_LOOKBACK = get_env_int("VOLATILITY_LOOKBACK", 6)
 
-# Range Settings - Trade WITH range breakout direction
-RANGE_LOOKBACK = int(os.getenv("RANGE_LOOKBACK", "30"))  # Period for range calculation
+# Range settings
+RANGE_LOOKBACK = get_env_int("RANGE_LOOKBACK", 30)
 
 # Notifications
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
-PRINT_EVERY_TICK = os.getenv("PRINT_EVERY_TICK", "false").lower() == "true"
-SIGNAL_COOLDOWN = int(os.getenv("SIGNAL_COOLDOWN", "2"))
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+CHAT_ID = os.getenv("CHAT_ID", "")
+PRINT_EVERY_TICK = get_env_bool("PRINT_EVERY_TICK", False)
+SIGNAL_COOLDOWN = get_env_int("SIGNAL_COOLDOWN", 2)
 
 # =========================
 # GLOBAL STATE
@@ -107,8 +130,8 @@ bot_status = {
     "running": False,
     "last_price": None,
     "last_signal": None,
-    "signal_type": None,  # MOMENTUM, STRETCH, VOLATILITY, RANGE, NONE
-    "signal_direction": None,  # CALL, PUT
+    "signal_type": None,
+    "signal_direction": None,
     "started_at": None,
     "trend": "➡️",
     "price_change": 0,
@@ -244,7 +267,7 @@ async def get_trading_ws():
                     
                     await trading_ws.send(json.dumps({"balance": 1}))
                     response = await asyncio.wait_for(trading_ws.recv(), timeout=5.0)
-                    if "balance" in data := json.loads(response):
+                    if "balance" in (data := json.loads(response)):
                         bot_status["balance"] = float(data["balance"]["balance"])
                 
                 logger.info("🔌 Trading WebSocket connected")
@@ -409,55 +432,42 @@ async def monitor_trade_with_new_ws(trade_id, contract_id):
         bot_status["concurrent_trades"] = max(0, bot_status["concurrent_trades"] - 1)
 
 # =========================
-# NEW DIRECTIONAL SIGNAL ANALYSIS
+# DIRECTIONAL SIGNAL ANALYSIS
 # =========================
 def analyze_signals_directional(prices_list):
-    """
-    Analyzes momentum, stretch, and volatility - trading IN THE DIRECTION of the signal.
-    Returns: (signal_type, direction, confidence, debug_info)
-    """
+    """Analyzes momentum, stretch, volatility - trading IN THE DIRECTION of the signal."""
     if len(prices_list) < 30:
         return "NONE", None, 0, {"error": "Insufficient data"}
     
     current = prices_list[-1]
     signals_found = []
     
-    # 1. MOMENTUM SIGNAL - Trade with momentum direction
     momentum_signal = check_momentum_directional(prices_list)
     if momentum_signal:
         signals_found.append(momentum_signal)
     
-    # 2. STRETCH SIGNAL - Trade with stretch direction (breakout)
     stretch_signal = check_stretch_directional(prices_list)
     if stretch_signal:
         signals_found.append(stretch_signal)
     
-    # 3. VOLATILITY/SPIKE SIGNAL - Trade with spike direction
     volatility_signal = check_volatility_directional(prices_list)
     if volatility_signal:
         signals_found.append(volatility_signal)
     
-    # 4. RANGE BREAKOUT - Trade with breakout direction
     range_signal = check_range_breakout(prices_list)
     if range_signal:
         signals_found.append(range_signal)
     
-    # Priority: Choose strongest signal
     if not signals_found:
         return "NONE", None, 0, {"status": "No signals"}
     
-    # Sort by confidence, pick highest
     signals_found.sort(key=lambda x: x["confidence"], reverse=True)
     best_signal = signals_found[0]
     
     return best_signal["type"], best_signal["direction"], best_signal["confidence"], best_signal["debug"]
 
 def check_momentum_directional(prices_list):
-    """
-    Check for strong momentum - trade IN the direction of momentum.
-    If more UP moves than threshold → CALL
-    If more DOWN moves than threshold → PUT
-    """
+    """Trade WITH momentum direction."""
     if len(prices_list) < MOMENTUM_LOOKBACK + 1:
         return None
     
@@ -468,42 +478,28 @@ def check_momentum_directional(prices_list):
     down_moves = sum(1 for m in moves if m < 0)
     total_moves = len(moves)
     
-    # Strong upward momentum
     if up_moves >= MOMENTUM_THRESHOLD:
         confidence = (up_moves / total_moves) * 100
         return {
             "type": "MOMENTUM",
             "direction": "CALL",
             "confidence": confidence,
-            "debug": {
-                "momentum_up": up_moves,
-                "momentum_down": down_moves,
-                "threshold": MOMENTUM_THRESHOLD
-            }
+            "debug": {"up": up_moves, "down": down_moves, "threshold": MOMENTUM_THRESHOLD}
         }
     
-    # Strong downward momentum
     if down_moves >= MOMENTUM_THRESHOLD:
         confidence = (down_moves / total_moves) * 100
         return {
             "type": "MOMENTUM",
             "direction": "PUT",
             "confidence": confidence,
-            "debug": {
-                "momentum_up": up_moves,
-                "momentum_down": down_moves,
-                "threshold": MOMENTUM_THRESHOLD
-            }
+            "debug": {"up": up_moves, "down": down_moves, "threshold": MOMENTUM_THRESHOLD}
         }
     
     return None
 
 def check_stretch_directional(prices_list):
-    """
-    Check for price stretch (breakout) - trade IN the direction of the stretch.
-    If price stretches UP above average → CALL (breakout up)
-    If price stretches DOWN below average → PUT (breakout down)
-    """
+    """Trade WITH stretch direction (breakout)."""
     if len(prices_list) < STRETCH_LOOKBACK:
         return None
     
@@ -513,55 +509,36 @@ def check_stretch_directional(prices_list):
     
     stretch = current - avg
     
-    # Upward stretch/breakout
     if stretch >= STRETCH_THRESHOLD:
-        confidence = min(abs(stretch) * 100, 100)  # Scale confidence
+        confidence = min(abs(stretch) * 100, 100)
         return {
             "type": "STRETCH",
             "direction": "CALL",
             "confidence": confidence,
-            "debug": {
-                "stretch": round(stretch, 3),
-                "avg": round(avg, 3),
-                "current": round(current, 3),
-                "threshold": STRETCH_THRESHOLD
-            }
+            "debug": {"stretch": round(stretch, 3), "avg": round(avg, 3)}
         }
     
-    # Downward stretch/breakout
     if stretch <= -STRETCH_THRESHOLD:
         confidence = min(abs(stretch) * 100, 100)
         return {
             "type": "STRETCH",
             "direction": "PUT",
             "confidence": confidence,
-            "debug": {
-                "stretch": round(stretch, 3),
-                "avg": round(avg, 3),
-                "current": round(current, 3),
-                "threshold": STRETCH_THRESHOLD
-            }
+            "debug": {"stretch": round(stretch, 3), "avg": round(avg, 3)}
         }
     
     return None
 
 def check_volatility_directional(prices_list):
-    """
-    Check for volatility spike - trade IN the direction of the spike.
-    Big move UP → CALL
-    Big move DOWN → PUT
-    """
+    """Trade WITH volatility spike direction."""
     if len(prices_list) < VOLATILITY_LOOKBACK + 1:
         return None
     
     recent = prices_list[-VOLATILITY_LOOKBACK:]
-    
-    # Check recent changes
     changes = [abs(recent[i] - recent[i-1]) for i in range(1, len(recent))]
     max_change = max(changes) if changes else 0
     
     if max_change >= VOLATILITY_THRESHOLD:
-        # Find direction of biggest move
         biggest_move_idx = changes.index(max_change)
         direction = "CALL" if (recent[biggest_move_idx + 1] > recent[biggest_move_idx]) else "PUT"
         
@@ -570,21 +547,13 @@ def check_volatility_directional(prices_list):
             "type": "VOLATILITY",
             "direction": direction,
             "confidence": confidence,
-            "debug": {
-                "max_spike": round(max_change, 3),
-                "direction": direction,
-                "threshold": VOLATILITY_THRESHOLD
-            }
+            "debug": {"max_spike": round(max_change, 3), "direction": direction}
         }
     
     return None
 
 def check_range_breakout(prices_list):
-    """
-    Check for range breakout - trade IN the direction of the breakout.
-    Break above range → CALL
-    Break below range → PUT
-    """
+    """Trade WITH range breakout direction."""
     if len(prices_list) < RANGE_LOOKBACK:
         return None
     
@@ -593,36 +562,21 @@ def check_range_breakout(prices_list):
     
     range_high = max(recent)
     range_low = min(recent)
-    range_size = range_high - range_low
     
-    # Breakout above range
-    if current > range_high * 0.999:  # Slight buffer
-        confidence = 70  # Base confidence for range breakout
+    if current > range_high * 0.999:
         return {
             "type": "RANGE_BREAKOUT",
             "direction": "CALL",
-            "confidence": confidence,
-            "debug": {
-                "range_high": round(range_high, 3),
-                "range_low": round(range_low, 3),
-                "current": round(current, 3),
-                "breakout": "UP"
-            }
+            "confidence": 70,
+            "debug": {"high": round(range_high, 3), "low": round(range_low, 3), "breakout": "UP"}
         }
     
-    # Breakout below range
-    if current < range_low * 1.001:  # Slight buffer
-        confidence = 70
+    if current < range_low * 1.001:
         return {
             "type": "RANGE_BREAKOUT",
             "direction": "PUT",
-            "confidence": confidence,
-            "debug": {
-                "range_high": round(range_high, 3),
-                "range_low": round(range_low, 3),
-                "current": round(current, 3),
-                "breakout": "DOWN"
-            }
+            "confidence": 70,
+            "debug": {"high": round(range_high, 3), "low": round(range_low, 3), "breakout": "DOWN"}
         }
     
     return None
@@ -680,7 +634,6 @@ async def stream_ticks():
                                 prices.pop(0)
                                 times.pop(0)
 
-                            # NEW DIRECTIONAL SIGNAL ANALYSIS
                             signal_type, direction, confidence, debug = analyze_signals_directional(prices)
                             
                             bot_status["last_price"] = quote
@@ -690,7 +643,6 @@ async def stream_ticks():
                             bot_status["trend"] = trend
                             bot_status["price_change"] = round(change, 3)
 
-                            # AUTO-TRADING - Trade in signal direction
                             if signal_type != "NONE" and direction and AUTO_TRADE_ENABLED:
                                 can_trade, reason = risk_manager.can_trade()
                                 if can_trade:
@@ -698,7 +650,6 @@ async def stream_ticks():
                                 elif "Daily" in reason or "limit" in reason:
                                     logger.warning(f"Trading blocked: {reason}")
 
-                            # LOGGING
                             if should_print() or signal_type != "NONE":
                                 pnl = f" | P&L:${bot_status['daily_pnl']:+.2f}" if AUTO_TRADE_ENABLED else ""
                                 signal_str = f" | {signal_type} {direction} ({confidence:.0f}%)" if direction else ""
@@ -719,6 +670,37 @@ async def stream_ticks():
     bot_status["running"] = False
     await close_trading_ws()
     logger.info("🛑 Bot stopped")
+
+def calculate_trend(current, previous):
+    if previous is None:
+        return "➡️", 0
+    change = current - previous
+    return ("⬆️", change) if change > 0 else ("⬇️", change) if change < 0 else ("➡️", 0)
+
+def should_print():
+    global last_signal, last_signal_time
+    now = time.time()
+    if PRINT_EVERY_TICK:
+        return True
+    if bot_status["last_signal"] != last_signal:
+        last_signal = bot_status["last_signal"]
+        last_signal_time = now
+        return True
+    if now - last_signal_time >= SIGNAL_COOLDOWN:
+        last_signal_time = now
+        return True
+    return False
+
+def send_telegram(msg):
+    if TELEGRAM_TOKEN and CHAT_ID:
+        try:
+            requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                json={"chat_id": CHAT_ID, "text": msg},
+                timeout=5
+            )
+        except Exception as e:
+            logger.error(f"Telegram error: {e}")
 
 # =========================
 # WEB SERVER
