@@ -7,7 +7,6 @@ from websocket_client import DerivWebSocket
 from dashboard import add_routes
 from models import market_state, last_signals
 
-# Initialize FastAPI
 app = FastAPI(title="Deriv Elite Scanner V3", version="3.0.0")
 
 # CORS
@@ -22,10 +21,8 @@ app.add_middleware(
 # Add dashboard route
 add_routes(app)
 
-# Analyzer instance
 analyzer = SignalAnalyzer()
 
-# Run WebSocket clients on startup
 @app.on_event("startup")
 async def startup_event():
     tasks = []
@@ -35,7 +32,6 @@ async def startup_event():
     app.state.tasks = tasks
     print("🚀 Deriv Elite Scanner V3 started...")
 
-# Graceful shutdown
 @app.on_event("shutdown")
 async def shutdown_event():
     for task in getattr(app.state, "tasks", []):
