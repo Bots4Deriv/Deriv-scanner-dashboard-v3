@@ -62,13 +62,23 @@ TRADE_DURATION_UNIT = os.getenv("TRADE_DURATION_UNIT", "m")
 COOLDOWN_AFTER_LOSS = int(os.getenv("COOLDOWN_AFTER_LOSS", "3"))
 COOLDOWN_AFTER_WIN = int(os.getenv("COOLDOWN_AFTER_WIN", "1"))
 
-# Signal Settings
+# Signal Settings - NOW DIRECTIONAL
 MAX_TICKS = int(os.getenv("MAX_TICKS", "200"))
-GENERAL_TREND_LOOKBACK = int(os.getenv("GENERAL_TREND_LOOKBACK", "300"))
-RANGE_LIMIT_30 = float(os.getenv("RANGE_LIMIT_30", "1.8"))
-STRETCH_LIMIT = float(os.getenv("STRETCH_LIMIT", "0.7"))
-MOMENTUM_LIMIT = int(os.getenv("MOMENTUM_LIMIT", "11"))
-SPIKE_LIMIT = float(os.getenv("SPIKE_LIMIT", "0.8"))
+
+# Momentum Settings - Trade WITH momentum direction
+MOMENTUM_THRESHOLD = int(os.getenv("MOMENTUM_THRESHOLD", "8"))  # Min up/down moves to trigger
+MOMENTUM_LOOKBACK = int(os.getenv("MOMENTUM_LOOKBACK", "15"))  # Ticks to analyze
+
+# Stretch Settings - Trade WITH stretch direction (breakout)
+STRETCH_THRESHOLD = float(os.getenv("STRETCH_THRESHOLD", "0.5"))  # Min distance from average
+STRETCH_LOOKBACK = int(os.getenv("STRETCH_LOOKBACK", "10"))  # Average period
+
+# Volatility Settings - Trade WITH volatility direction (breakout)
+VOLATILITY_THRESHOLD = float(os.getenv("VOLATILITY_THRESHOLD", "0.6"))  # Min spike size
+VOLATILITY_LOOKBACK = int(os.getenv("VOLATILITY_LOOKBACK", "6"))  # Recent ticks to check
+
+# Range Settings - Trade WITH range breakout direction
+RANGE_LOOKBACK = int(os.getenv("RANGE_LOOKBACK", "30"))  # Period for range calculation
 
 # Notifications
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -85,22 +95,23 @@ last_signal = None
 last_signal_time = 0
 previous_price = None
 price_history = []
-general_trend_history = deque(maxlen=GENERAL_TREND_LOOKBACK)
+general_trend_history = deque(maxlen=300)
 shutdown_event = asyncio.Event()
 
 # Separate WebSocket connections
-market_ws = None      # For ticks/market data
-trading_ws = None     # For trading operations
-trading_ws_lock = asyncio.Lock()  # Lock for trading WS operations
+market_ws = None
+trading_ws = None
+trading_ws_lock = asyncio.Lock()
 
 bot_status = {
     "running": False,
     "last_price": None,
     "last_signal": None,
+    "signal_type": None,  # MOMENTUM, STRETCH, VOLATILITY, RANGE, NONE
+    "signal_direction": None,  # CALL, PUT
     "started_at": None,
     "trend": "➡️",
     "price_change": 0,
-    "general_trend": {},
     "balance": 0.0,
     "daily_pnl": 0.0,
     "total_trades_today": 0,
@@ -217,50 +228,40 @@ class RiskManager:
 risk_manager = RiskManager()
 
 # =========================
-# TRADING WEBSOCKET (Separate Connection)
+# TRADING WEBSOCKET
 # =========================
 async def get_trading_ws():
-    """Get or create dedicated trading WebSocket"""
     global trading_ws
-    
     async with trading_ws_lock:
         if trading_ws is None or trading_ws.closed:
             try:
                 url = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
                 trading_ws = await websockets.connect(url, ping_interval=20, ping_timeout=20)
                 
-                # Authorize immediately
                 if DERIV_API_TOKEN:
                     await trading_ws.send(json.dumps({"authorize": DERIV_API_TOKEN}))
                     response = await asyncio.wait_for(trading_ws.recv(), timeout=5.0)
-                    data = json.loads(response)
                     
-                    if "authorize" in data:
-                        # Get balance
-                        await trading_ws.send(json.dumps({"balance": 1}))
-                        response = await asyncio.wait_for(trading_ws.recv(), timeout=5.0)
-                        data = json.loads(response)
-                        if "balance" in data:
-                            bot_status["balance"] = float(data["balance"]["balance"])
+                    await trading_ws.send(json.dumps({"balance": 1}))
+                    response = await asyncio.wait_for(trading_ws.recv(), timeout=5.0)
+                    if "balance" in data := json.loads(response):
+                        bot_status["balance"] = float(data["balance"]["balance"])
                 
                 logger.info("🔌 Trading WebSocket connected")
             except Exception as e:
                 logger.error(f"Trading WS error: {e}")
                 trading_ws = None
                 return None
-        
         return trading_ws
 
 async def close_trading_ws():
-    """Close trading WebSocket gracefully"""
     global trading_ws
     async with trading_ws_lock:
         if trading_ws and not trading_ws.closed:
             await trading_ws.close()
             trading_ws = None
 
-async def place_trade(contract_type="CALL"):
-    """Place trade using dedicated WebSocket"""
+async def place_trade(contract_type, signal_type="UNKNOWN"):
     can_trade, reason = risk_manager.can_trade()
     if not can_trade:
         logger.info(f"Trade blocked: {reason}")
@@ -270,10 +271,9 @@ async def place_trade(contract_type="CALL"):
     if stake <= 0:
         return None
     
-    # Get fresh trading connection
     ws = await get_trading_ws()
     if not ws:
-        logger.error("No trading connection available")
+        logger.error("No trading connection")
         return None
     
     trade_id = str(uuid.uuid4())[:8]
@@ -305,6 +305,7 @@ async def place_trade(contract_type="CALL"):
                     "id": trade_id,
                     "contract_id": contract_id,
                     "type": contract_type,
+                    "signal_type": signal_type,
                     "stake": stake,
                     "entry_price": bot_status["last_price"],
                     "symbol": SYMBOL,
@@ -315,10 +316,10 @@ async def place_trade(contract_type="CALL"):
                 active_trades[trade_id] = trade_info
                 bot_status["concurrent_trades"] += 1
                 
-                # Start monitor in separate task with its own connection
                 asyncio.create_task(monitor_trade_with_new_ws(trade_id, contract_id))
                 
-                msg = f"🚀 TRADE: {contract_type} ${stake:.2f} | ID: {trade_id}"
+                emoji = "📈" if contract_type == "CALL" else "📉"
+                msg = f"🚀 {signal_type} {emoji} {contract_type} ${stake:.2f} | ID: {trade_id}"
                 logger.info(msg)
                 send_telegram(msg)
                 return trade_info
@@ -332,22 +333,15 @@ async def place_trade(contract_type="CALL"):
         return None
 
 async def monitor_trade_with_new_ws(trade_id, contract_id):
-    """
-    Monitor trade using a COMPLETELY SEPARATE WebSocket connection.
-    This avoids the 'another coroutine' error.
-    """
     ws = None
     try:
-        # Create independent connection for this monitor
         url = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
         ws = await websockets.connect(url, ping_interval=20, ping_timeout=20)
         
-        # Authorize
         if DERIV_API_TOKEN:
             await ws.send(json.dumps({"authorize": DERIV_API_TOKEN}))
             await asyncio.wait_for(ws.recv(), timeout=5.0)
         
-        # Subscribe to contract updates
         subscribe_msg = {
             "proposal_open_contract": 1,
             "contract_id": contract_id,
@@ -362,13 +356,11 @@ async def monitor_trade_with_new_ws(trade_id, contract_id):
                 
                 if "proposal_open_contract" in data:
                     contract = data["proposal_open_contract"]
-                    
-                    # Update current profit
                     current_profit = float(contract.get("profit", 0))
+                    
                     if trade_id in active_trades:
                         active_trades[trade_id]["current_profit"] = current_profit
                     
-                    # Check if sold/completed
                     if contract.get("is_sold"):
                         profit = float(contract.get("profit", 0))
                         status = "WIN" if profit > 0 else "LOSS"
@@ -384,7 +376,8 @@ async def monitor_trade_with_new_ws(trade_id, contract_id):
                         risk_manager.update_after_trade(profit)
                         
                         emoji = "✅" if profit > 0 else "❌"
-                        msg = f"{emoji} {status} ${profit:+.2f} | ID: {trade_id} | Daily: ${bot_status['daily_pnl']:.2f}"
+                        signal_type = active_trades.get(trade_id, {}).get("signal_type", "UNKNOWN")
+                        msg = f"{emoji} {signal_type} {status} ${profit:+.2f} | ID: {trade_id} | Daily: ${bot_status['daily_pnl']:.2f}"
                         logger.info(msg)
                         send_telegram(msg)
                         
@@ -396,7 +389,6 @@ async def monitor_trade_with_new_ws(trade_id, contract_id):
                 continue
             except websockets.exceptions.ConnectionClosed:
                 logger.warning(f"Monitor WS closed for {trade_id}, reconnecting...")
-                # Reconnect and resubscribe
                 try:
                     ws = await websockets.connect(url, ping_interval=20, ping_timeout=20)
                     if DERIV_API_TOKEN:
@@ -412,109 +404,231 @@ async def monitor_trade_with_new_ws(trade_id, contract_id):
     finally:
         if ws and not ws.closed:
             await ws.close()
-        # Ensure trade count is decremented if something went wrong
         if trade_id in active_trades:
             del active_trades[trade_id]
         bot_status["concurrent_trades"] = max(0, bot_status["concurrent_trades"] - 1)
 
 # =========================
-# CORE ANALYSIS
+# NEW DIRECTIONAL SIGNAL ANALYSIS
 # =========================
-def calculate_trend(current, previous):
-    if previous is None:
-        return "➡️", 0
-    change = current - previous
-    return ("⬆️", change) if change > 0 else ("⬇️", change) if change < 0 else ("➡️", 0)
-
-def calculate_general_trend():
-    if len(general_trend_history) < 50:
-        return {"direction": "INSUFFICIENT DATA ⏳", "strength": 0, "duration_ticks": len(general_trend_history)}
-    
-    prices_list = list(general_trend_history)
-    start, current = prices_list[0], prices_list[-1]
-    total_change = current - start
-    pct_change = (total_change / start) * 100 if start != 0 else 0
-    
-    up = sum(1 for i in range(1, len(prices_list)) if prices_list[i] > prices_list[i-1])
-    down = len(prices_list) - 1 - up
-    
-    direction = "BULLISH 📈" if pct_change > 1 else "BEARISH 📉" if pct_change < -1 else "NEUTRAL ➡️"
-    consistency = max(up, down) / (up + down) if (up + down) > 0 else 0
-    strength = min(abs(pct_change) * 10, 50) + (consistency * 50)
-    
-    return {
-        "direction": direction,
-        "strength": round(max(0, min(100, strength)), 1),
-        "strength_emoji": "🔥" if strength >= 70 else "⚡" if strength >= 40 else "💤",
-        "duration_ticks": len(prices_list),
-        "total_change": round(total_change, 3),
-        "percent_change": round(pct_change, 2),
-        "consistency": round(consistency * 100, 1),
-        "up_moves": up,
-        "down_moves": down
-    }
-
-def analyze_signal(prices_list):
+def analyze_signals_directional(prices_list):
+    """
+    Analyzes momentum, stretch, and volatility - trading IN THE DIRECTION of the signal.
+    Returns: (signal_type, direction, confidence, debug_info)
+    """
     if len(prices_list) < 30:
-        return "WAIT", {}
+        return "NONE", None, 0, {"error": "Insufficient data"}
     
-    last_30 = prices_list[-30:]
-    last_15 = prices_list[-15:]
+    current = prices_list[-1]
+    signals_found = []
+    
+    # 1. MOMENTUM SIGNAL - Trade with momentum direction
+    momentum_signal = check_momentum_directional(prices_list)
+    if momentum_signal:
+        signals_found.append(momentum_signal)
+    
+    # 2. STRETCH SIGNAL - Trade with stretch direction (breakout)
+    stretch_signal = check_stretch_directional(prices_list)
+    if stretch_signal:
+        signals_found.append(stretch_signal)
+    
+    # 3. VOLATILITY/SPIKE SIGNAL - Trade with spike direction
+    volatility_signal = check_volatility_directional(prices_list)
+    if volatility_signal:
+        signals_found.append(volatility_signal)
+    
+    # 4. RANGE BREAKOUT - Trade with breakout direction
+    range_signal = check_range_breakout(prices_list)
+    if range_signal:
+        signals_found.append(range_signal)
+    
+    # Priority: Choose strongest signal
+    if not signals_found:
+        return "NONE", None, 0, {"status": "No signals"}
+    
+    # Sort by confidence, pick highest
+    signals_found.sort(key=lambda x: x["confidence"], reverse=True)
+    best_signal = signals_found[0]
+    
+    return best_signal["type"], best_signal["direction"], best_signal["confidence"], best_signal["debug"]
+
+def check_momentum_directional(prices_list):
+    """
+    Check for strong momentum - trade IN the direction of momentum.
+    If more UP moves than threshold → CALL
+    If more DOWN moves than threshold → PUT
+    """
+    if len(prices_list) < MOMENTUM_LOOKBACK + 1:
+        return None
+    
+    recent = prices_list[-MOMENTUM_LOOKBACK:]
+    moves = [recent[i] - recent[i-1] for i in range(1, len(recent))]
+    
+    up_moves = sum(1 for m in moves if m > 0)
+    down_moves = sum(1 for m in moves if m < 0)
+    total_moves = len(moves)
+    
+    # Strong upward momentum
+    if up_moves >= MOMENTUM_THRESHOLD:
+        confidence = (up_moves / total_moves) * 100
+        return {
+            "type": "MOMENTUM",
+            "direction": "CALL",
+            "confidence": confidence,
+            "debug": {
+                "momentum_up": up_moves,
+                "momentum_down": down_moves,
+                "threshold": MOMENTUM_THRESHOLD
+            }
+        }
+    
+    # Strong downward momentum
+    if down_moves >= MOMENTUM_THRESHOLD:
+        confidence = (down_moves / total_moves) * 100
+        return {
+            "type": "MOMENTUM",
+            "direction": "PUT",
+            "confidence": confidence,
+            "debug": {
+                "momentum_up": up_moves,
+                "momentum_down": down_moves,
+                "threshold": MOMENTUM_THRESHOLD
+            }
+        }
+    
+    return None
+
+def check_stretch_directional(prices_list):
+    """
+    Check for price stretch (breakout) - trade IN the direction of the stretch.
+    If price stretches UP above average → CALL (breakout up)
+    If price stretches DOWN below average → PUT (breakout down)
+    """
+    if len(prices_list) < STRETCH_LOOKBACK:
+        return None
+    
+    recent = prices_list[-STRETCH_LOOKBACK:]
+    avg = statistics.mean(recent)
     current = prices_list[-1]
     
-    range_30 = max(last_30) - min(last_30)
-    if range_30 > RANGE_LIMIT_30:
-        return "WAIT - HIGH VOLATILITY", {"range_30": round(range_30, 3)}
+    stretch = current - avg
     
-    avg_10 = sum(prices_list[-10:]) / 10
-    stretch = abs(current - avg_10)
-    if stretch > STRETCH_LIMIT:
-        return "WAIT - STRETCHED", {"stretch": round(stretch, 3)}
+    # Upward stretch/breakout
+    if stretch >= STRETCH_THRESHOLD:
+        confidence = min(abs(stretch) * 100, 100)  # Scale confidence
+        return {
+            "type": "STRETCH",
+            "direction": "CALL",
+            "confidence": confidence,
+            "debug": {
+                "stretch": round(stretch, 3),
+                "avg": round(avg, 3),
+                "current": round(current, 3),
+                "threshold": STRETCH_THRESHOLD
+            }
+        }
     
-    moves = [last_15[i] - last_15[i-1] for i in range(1, len(last_15))]
-    up = sum(1 for m in moves if m > 0)
-    down = sum(1 for m in moves if m < 0)
-    if up >= MOMENTUM_LIMIT or down >= MOMENTUM_LIMIT:
-        return "WAIT - MOMENTUM", {"up": up, "down": down}
+    # Downward stretch/breakout
+    if stretch <= -STRETCH_THRESHOLD:
+        confidence = min(abs(stretch) * 100, 100)
+        return {
+            "type": "STRETCH",
+            "direction": "PUT",
+            "confidence": confidence,
+            "debug": {
+                "stretch": round(stretch, 3),
+                "avg": round(avg, 3),
+                "current": round(current, 3),
+                "threshold": STRETCH_THRESHOLD
+            }
+        }
     
-    recent_changes = [abs(prices_list[-6:][i]-prices_list[-6:][i-1]) for i in range(1, 6)]
-    if max(recent_changes) > SPIKE_LIMIT:
-        return "WAIT - SPIKE", {"max_spike": max(recent_changes)}
-    
-    return "ENTER", {
-        "range_30": round(range_30, 3),
-        "stretch": round(stretch, 3),
-        "up_moves": up,
-        "down_moves": down
-    }
+    return None
 
-def should_print():
-    global last_signal, last_signal_time
-    now = time.time()
-    if PRINT_EVERY_TICK:
-        return True
-    if bot_status["last_signal"] != last_signal:
-        last_signal = bot_status["last_signal"]
-        last_signal_time = now
-        return True
-    if now - last_signal_time >= SIGNAL_COOLDOWN:
-        last_signal_time = now
-        return True
-    return False
+def check_volatility_directional(prices_list):
+    """
+    Check for volatility spike - trade IN the direction of the spike.
+    Big move UP → CALL
+    Big move DOWN → PUT
+    """
+    if len(prices_list) < VOLATILITY_LOOKBACK + 1:
+        return None
+    
+    recent = prices_list[-VOLATILITY_LOOKBACK:]
+    
+    # Check recent changes
+    changes = [abs(recent[i] - recent[i-1]) for i in range(1, len(recent))]
+    max_change = max(changes) if changes else 0
+    
+    if max_change >= VOLATILITY_THRESHOLD:
+        # Find direction of biggest move
+        biggest_move_idx = changes.index(max_change)
+        direction = "CALL" if (recent[biggest_move_idx + 1] > recent[biggest_move_idx]) else "PUT"
+        
+        confidence = min(max_change * 100, 100)
+        return {
+            "type": "VOLATILITY",
+            "direction": direction,
+            "confidence": confidence,
+            "debug": {
+                "max_spike": round(max_change, 3),
+                "direction": direction,
+                "threshold": VOLATILITY_THRESHOLD
+            }
+        }
+    
+    return None
 
-def send_telegram(msg):
-    if TELEGRAM_TOKEN and CHAT_ID:
-        try:
-            requests.post(
-                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                json={"chat_id": CHAT_ID, "text": msg},
-                timeout=5
-            )
-        except Exception as e:
-            logger.error(f"Telegram error: {e}")
+def check_range_breakout(prices_list):
+    """
+    Check for range breakout - trade IN the direction of the breakout.
+    Break above range → CALL
+    Break below range → PUT
+    """
+    if len(prices_list) < RANGE_LOOKBACK:
+        return None
+    
+    recent = prices_list[-RANGE_LOOKBACK:]
+    current = prices_list[-1]
+    
+    range_high = max(recent)
+    range_low = min(recent)
+    range_size = range_high - range_low
+    
+    # Breakout above range
+    if current > range_high * 0.999:  # Slight buffer
+        confidence = 70  # Base confidence for range breakout
+        return {
+            "type": "RANGE_BREAKOUT",
+            "direction": "CALL",
+            "confidence": confidence,
+            "debug": {
+                "range_high": round(range_high, 3),
+                "range_low": round(range_low, 3),
+                "current": round(current, 3),
+                "breakout": "UP"
+            }
+        }
+    
+    # Breakout below range
+    if current < range_low * 1.001:  # Slight buffer
+        confidence = 70
+        return {
+            "type": "RANGE_BREAKOUT",
+            "direction": "PUT",
+            "confidence": confidence,
+            "debug": {
+                "range_high": round(range_high, 3),
+                "range_low": round(range_low, 3),
+                "current": round(current, 3),
+                "breakout": "DOWN"
+            }
+        }
+    
+    return None
 
 # =========================
-# MARKET DATA WEBSOCKET (Main Loop)
+# MAIN LOOP
 # =========================
 async def stream_ticks():
     global prices, times, price_history, previous_price, general_trend_history, market_ws
@@ -524,6 +638,7 @@ async def stream_ticks():
     bot_status["started_at"] = get_eat_timestamp()
     
     logger.info(f"🚀 Starting | Symbol: {SYMBOL} | Trading: {AUTO_TRADE_ENABLED}")
+    logger.info(f"📊 Signals: MOMENTUM↑↓ | STRETCH↑↓ | VOLATILITY↑↓ | RANGE↑↓")
 
     while not shutdown_event.is_set():
         try:
@@ -531,15 +646,6 @@ async def stream_ticks():
                 market_ws = ws
                 logger.info("✅ Market WebSocket connected")
                 
-                # Only for balance display - trading WS handles actual trading
-                if AUTO_TRADE_ENABLED and DERIV_API_TOKEN:
-                    try:
-                        await ws.send(json.dumps({"authorize": DERIV_API_TOKEN}))
-                        response = await asyncio.wait_for(ws.recv(), timeout=3.0)
-                        # Don't process further, just for auth
-                    except:
-                        pass
-
                 await ws.send(json.dumps({"ticks": SYMBOL, "subscribe": 1}))
 
                 while not shutdown_event.is_set():
@@ -559,8 +665,6 @@ async def stream_ticks():
                             previous_price = quote
                             
                             general_trend_history.append(quote)
-                            general_trend = calculate_general_trend()
-                            bot_status["general_trend"] = general_trend
                             
                             prices.append(quote)
                             times.append(tick["epoch"])
@@ -576,26 +680,29 @@ async def stream_ticks():
                                 prices.pop(0)
                                 times.pop(0)
 
-                            signal, debug = analyze_signal(prices)
+                            # NEW DIRECTIONAL SIGNAL ANALYSIS
+                            signal_type, direction, confidence, debug = analyze_signals_directional(prices)
+                            
                             bot_status["last_price"] = quote
-                            bot_status["last_signal"] = signal
+                            bot_status["last_signal"] = f"{signal_type} {direction}" if direction else "NONE"
+                            bot_status["signal_type"] = signal_type
+                            bot_status["signal_direction"] = direction
                             bot_status["trend"] = trend
                             bot_status["price_change"] = round(change, 3)
 
-                            # AUTO-TRADING
-                            if signal == "ENTER" and AUTO_TRADE_ENABLED:
+                            # AUTO-TRADING - Trade in signal direction
+                            if signal_type != "NONE" and direction and AUTO_TRADE_ENABLED:
                                 can_trade, reason = risk_manager.can_trade()
                                 if can_trade:
-                                    direction = "CALL" if "BULLISH" in general_trend.get("direction", "") else \
-                                               "PUT" if "BEARISH" in general_trend.get("direction", "") else \
-                                               "CALL" if trend == "⬆️" else "PUT"
-                                    await place_trade(direction)
+                                    await place_trade(direction, signal_type)
                                 elif "Daily" in reason or "limit" in reason:
                                     logger.warning(f"Trading blocked: {reason}")
 
-                            if should_print():
+                            # LOGGING
+                            if should_print() or signal_type != "NONE":
                                 pnl = f" | P&L:${bot_status['daily_pnl']:+.2f}" if AUTO_TRADE_ENABLED else ""
-                                logger.info(f"[{get_eat_clock()}] {quote:.3f} {trend} | {signal}{pnl}")
+                                signal_str = f" | {signal_type} {direction} ({confidence:.0f}%)" if direction else ""
+                                logger.info(f"[{get_eat_clock()}] {quote:.3f} {trend}{signal_str}{pnl}")
 
                     except asyncio.TimeoutError:
                         continue
@@ -639,7 +746,8 @@ async def api_status(request):
         "trading_enabled": AUTO_TRADE_ENABLED,
         "last_price": bot_status.get("last_price"),
         "last_signal": bot_status.get("last_signal"),
-        "general_trend": bot_status.get("general_trend", {}),
+        "signal_type": bot_status.get("signal_type"),
+        "signal_direction": bot_status.get("signal_direction"),
         "price_history": price_history[-50:],
         "balance": round(bot_status.get("balance", 0), 2),
         "daily_pnl": round(bot_status.get("daily_pnl", 0), 2),
@@ -648,7 +756,7 @@ async def api_status(request):
         "loss_count": bot_status.get("loss_count", 0),
         "win_rate": round(win_rate, 1),
         "concurrent_trades": bot_status.get("concurrent_trades", 0),
-        "active_trades": active_trades,
+        "active_trades": {k: v for k, v in active_trades.items()},
         "daily_limit_hit": bot_status.get("daily_limit_hit", False),
         "cooldown_remaining": cooldown_remaining,
         "next_stake": risk_manager.calculate_stake() if AUTO_TRADE_ENABLED else 0
