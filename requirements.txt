@@ -1,4 +1,4 @@
-fastapi
-uvicorn
-websockets
-numpy
+websockets>=11.0
+aiohttp>=3.8
+requests>=2.28
+pytz>=2023.3
