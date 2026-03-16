@@ -15,7 +15,6 @@ RUN pip install --no-cache-dir --upgrade pip \
 EXPOSE 8000
 
 # Set default environment variables (can be overridden at runtime)
-ENV DERIV_API_TOKEN="YOUR_API_TOKEN"
 ENV DERIV_APP_ID="1089"
 ENV TIMEFRAME="60"
 ENV CANDLE_COUNT="80"
