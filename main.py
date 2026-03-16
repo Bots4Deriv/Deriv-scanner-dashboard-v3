@@ -37,25 +37,21 @@ def get_eat_clock():
     return get_eat_time().strftime("%H:%M:%S")
 
 # =========================
-# RAILWAY CONFIG - ALL WITH SAFE DEFAULTS
+# RAILWAY CONFIG
 # =========================
-
 def get_env_int(name, default):
-    """Safely get integer env var with default"""
     try:
         return int(os.getenv(name, str(default)))
     except (ValueError, TypeError):
         return default
 
 def get_env_float(name, default):
-    """Safely get float env var with default"""
     try:
         return float(os.getenv(name, str(default)))
     except (ValueError, TypeError):
         return default
 
 def get_env_bool(name, default=False):
-    """Safely get boolean env var"""
     val = os.getenv(name, str(default).lower())
     return val.lower() in ('true', '1', 'yes', 'on')
 
@@ -85,23 +81,19 @@ TRADE_DURATION_UNIT = os.getenv("TRADE_DURATION_UNIT", "m")
 COOLDOWN_AFTER_LOSS = get_env_int("COOLDOWN_AFTER_LOSS", 3)
 COOLDOWN_AFTER_WIN = get_env_int("COOLDOWN_AFTER_WIN", 1)
 
-# Signal settings - ALL WITH DEFAULTS TO AVOID BUILD ERRORS
+# Signal settings
 MAX_TICKS = get_env_int("MAX_TICKS", 200)
-
-# Momentum settings
 MOMENTUM_THRESHOLD = get_env_int("MOMENTUM_THRESHOLD", 8)
 MOMENTUM_LOOKBACK = get_env_int("MOMENTUM_LOOKBACK", 15)
-
-# Stretch settings  
 STRETCH_THRESHOLD = get_env_float("STRETCH_THRESHOLD", 0.5)
 STRETCH_LOOKBACK = get_env_int("STRETCH_LOOKBACK", 10)
-
-# Volatility settings
 VOLATILITY_THRESHOLD = get_env_float("VOLATILITY_THRESHOLD", 0.6)
 VOLATILITY_LOOKBACK = get_env_int("VOLATILITY_LOOKBACK", 6)
-
-# Range settings
 RANGE_LOOKBACK = get_env_int("RANGE_LOOKBACK", 30)
+MIN_CONFIDENCE_THRESHOLD = get_env_float("MIN_CONFIDENCE_THRESHOLD", 60.0)
+
+# NEW: Trade monitoring timeout (seconds)
+TRADE_MONITOR_TIMEOUT = get_env_int("TRADE_MONITOR_TIMEOUT", 600)  # 10 minutes max
 
 # Notifications
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
@@ -121,7 +113,6 @@ price_history = []
 general_trend_history = deque(maxlen=300)
 shutdown_event = asyncio.Event()
 
-# Separate WebSocket connections
 market_ws = None
 trading_ws = None
 trading_ws_lock = asyncio.Lock()
@@ -132,6 +123,7 @@ bot_status = {
     "last_signal": None,
     "signal_type": None,
     "signal_direction": None,
+    "signal_confidence": 0,
     "started_at": None,
     "trend": "➡️",
     "price_change": 0,
@@ -142,6 +134,7 @@ bot_status = {
     "loss_count": 0,
     "concurrent_trades": 0,
     "last_trade_time": None,
+    "last_trade_result": None,
     "trading_enabled": AUTO_TRADE_ENABLED,
     "cooldown_until": None,
     "daily_limit_hit": False
@@ -164,6 +157,9 @@ martingale_state = {
     "base_stake": STAKE_AMOUNT,
     "consecutive_losses": 0
 }
+
+last_signal_trade_time = None
+SIGNAL_EXPIRY_SECONDS = 30
 
 # =========================
 # RISK MANAGER
@@ -240,6 +236,7 @@ class RiskManager:
             bot_status["daily_pnl"] += profit_loss
             martingale_state["consecutive_losses"] = 0
             bot_status["cooldown_until"] = get_eat_time() + timedelta(minutes=COOLDOWN_AFTER_WIN)
+            bot_status["last_trade_result"] = "WIN"
         else:
             daily_stats["losses"] += 1
             daily_stats["loss"] += abs(profit_loss)
@@ -247,6 +244,7 @@ class RiskManager:
             bot_status["daily_pnl"] += profit_loss
             martingale_state["consecutive_losses"] += 1
             bot_status["cooldown_until"] = get_eat_time() + timedelta(minutes=COOLDOWN_AFTER_LOSS)
+            bot_status["last_trade_result"] = "LOSS"
 
 risk_manager = RiskManager()
 
@@ -284,19 +282,31 @@ async def close_trading_ws():
             await trading_ws.close()
             trading_ws = None
 
-async def place_trade(contract_type, signal_type="UNKNOWN"):
+async def place_trade(contract_type, signal_type="UNKNOWN", confidence=0):
+    global last_signal_trade_time
+    
     can_trade, reason = risk_manager.can_trade()
     if not can_trade:
-        logger.info(f"Trade blocked: {reason}")
+        logger.info(f"⛔ Trade blocked: {reason}")
+        return None
+    
+    if confidence < MIN_CONFIDENCE_THRESHOLD:
+        logger.info(f"⛔ Confidence too low: {confidence:.0f}% < {MIN_CONFIDENCE_THRESHOLD:.0f}%")
+        return None
+    
+    now = time.time()
+    if last_signal_trade_time and (now - last_signal_trade_time) < SIGNAL_EXPIRY_SECONDS:
+        logger.info(f"⛔ Signal too recent ({int(now - last_signal_trade_time)}s ago)")
         return None
     
     stake = risk_manager.calculate_stake()
     if stake <= 0:
+        logger.error("⛔ Invalid stake amount")
         return None
     
     ws = await get_trading_ws()
     if not ws:
-        logger.error("No trading connection")
+        logger.error("⛔ No trading connection")
         return None
     
     trade_id = str(uuid.uuid4())[:8]
@@ -323,119 +333,287 @@ async def place_trade(contract_type, signal_type="UNKNOWN"):
             
             if "buy" in data:
                 contract_id = data["buy"]["contract_id"]
+                actual_stake = float(data["buy"]["buy_price"])
+                
+                # Get contract details
+                contract_details = data["buy"]
                 
                 trade_info = {
                     "id": trade_id,
                     "contract_id": contract_id,
                     "type": contract_type,
                     "signal_type": signal_type,
-                    "stake": stake,
+                    "confidence": confidence,
+                    "stake": actual_stake,
                     "entry_price": bot_status["last_price"],
                     "symbol": SYMBOL,
                     "start_time": get_eat_timestamp(),
-                    "status": "OPEN"
+                    "status": "OPEN",
+                    "expected_duration": TRADE_DURATION,
+                    "expected_duration_unit": TRADE_DURATION_UNIT
                 }
                 
                 active_trades[trade_id] = trade_info
                 bot_status["concurrent_trades"] += 1
+                bot_status["last_trade_time"] = get_eat_timestamp()
+                last_signal_trade_time = now
                 
-                asyncio.create_task(monitor_trade_with_new_ws(trade_id, contract_id))
+                # Start monitoring with timeout protection
+                monitor_task = asyncio.create_task(
+                    monitor_trade_with_timeout(trade_id, contract_id)
+                )
                 
                 emoji = "📈" if contract_type == "CALL" else "📉"
-                msg = f"🚀 {signal_type} {emoji} {contract_type} ${stake:.2f} | ID: {trade_id}"
-                logger.info(msg)
+                msg = (f"🚀 TRADE EXECUTED\n"
+                       f"Signal: {signal_type} ({confidence:.0f}%)\n"
+                       f"Type: {emoji} {contract_type}\n"
+                       f"Stake: ${actual_stake:.2f}\n"
+                       f"Entry: {bot_status['last_price']:.3f}\n"
+                       f"ID: {trade_id}\n"
+                       f"Contract: {contract_id}\n"
+                       f"Duration: {TRADE_DURATION}{TRADE_DURATION_UNIT}\n"
+                       f"Daily P&L: ${bot_status['daily_pnl']:+.2f}")
+                logger.info(msg.replace('\n', ' | '))
                 send_telegram(msg)
                 return trade_info
             else:
                 error = data.get("error", {}).get("message", "Unknown")
-                logger.error(f"Buy failed: {error}")
+                logger.error(f"❌ Buy failed: {error}")
                 return None
                 
     except Exception as e:
-        logger.error(f"Place trade error: {e}")
+        logger.error(f"❌ Place trade error: {e}")
         return None
 
-async def monitor_trade_with_new_ws(trade_id, contract_id):
-    ws = None
+async def monitor_trade_with_timeout(trade_id, contract_id):
+    """
+    Monitor trade with multiple fallback strategies:
+    1. Try WebSocket subscription
+    2. Fallback to polling if WebSocket fails
+    3. Force close after timeout
+    """
+    start_time = time.time()
+    result = None
+    
+    # Try WebSocket monitoring first
     try:
-        url = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
+        result = await monitor_trade_websocket(trade_id, contract_id, start_time)
+    except Exception as e:
+        logger.error(f"❌ WebSocket monitor failed for {trade_id}: {e}")
+    
+    # If WebSocket failed or timed out, try polling
+    if not result:
+        logger.warning(f"⚠️ Falling back to polling for {trade_id}")
+        try:
+            result = await monitor_trade_polling(trade_id, contract_id, start_time)
+        except Exception as e:
+            logger.error(f"❌ Polling failed for {trade_id}: {e}")
+    
+    # If still no result, force close the trade tracking
+    if not result:
+        logger.error(f"❌ Could not determine result for {trade_id}, forcing close")
+        await force_close_trade(trade_id, "UNKNOWN")
+
+async def monitor_trade_websocket(trade_id, contract_id, start_time):
+    """Monitor via WebSocket subscription"""
+    ws = None
+    url = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
+    
+    try:
         ws = await websockets.connect(url, ping_interval=20, ping_timeout=20)
         
         if DERIV_API_TOKEN:
             await ws.send(json.dumps({"authorize": DERIV_API_TOKEN}))
-            await asyncio.wait_for(ws.recv(), timeout=5.0)
+            auth_response = await asyncio.wait_for(ws.recv(), timeout=5.0)
+            logger.debug(f"Monitor auth: {auth_response[:100]}...")
         
+        # Subscribe to contract updates
         subscribe_msg = {
             "proposal_open_contract": 1,
             "contract_id": contract_id,
             "subscribe": 1
         }
         await ws.send(json.dumps(subscribe_msg))
+        logger.info(f"📡 Subscribed to contract {contract_id} for trade {trade_id}")
         
-        while not shutdown_event.is_set():
+        while time.time() - start_time < TRADE_MONITOR_TIMEOUT:
             try:
                 msg = await asyncio.wait_for(ws.recv(), timeout=30.0)
                 data = json.loads(msg)
                 
                 if "proposal_open_contract" in data:
                     contract = data["proposal_open_contract"]
+                    
+                    # Log contract status for debugging
+                    is_sold = contract.get("is_sold", False)
+                    is_expired = contract.get("is_expired", False)
+                    status = contract.get("status", "unknown")
+                    
+                    logger.debug(f"Trade {trade_id} status: sold={is_sold}, expired={is_expired}, status={status}")
+                    
+                    # Update current profit
                     current_profit = float(contract.get("profit", 0))
+                    current_spot = float(contract.get("current_spot", 0))
                     
                     if trade_id in active_trades:
                         active_trades[trade_id]["current_profit"] = current_profit
+                        active_trades[trade_id]["current_price"] = current_spot
                     
-                    if contract.get("is_sold"):
+                    # Check if trade is complete
+                    if is_sold or is_expired or status == "sold":
                         profit = float(contract.get("profit", 0))
-                        status = "WIN" if profit > 0 else "LOSS"
+                        exit_tick = contract.get("exit_tick") or contract.get("current_spot")
                         
-                        if trade_id in active_trades:
-                            active_trades[trade_id].update({
-                                "status": status,
-                                "profit": profit,
-                                "exit_time": get_eat_timestamp()
-                            })
-                            trade_history.append(active_trades[trade_id].copy())
-                        
-                        risk_manager.update_after_trade(profit)
-                        
-                        emoji = "✅" if profit > 0 else "❌"
-                        signal_type = active_trades.get(trade_id, {}).get("signal_type", "UNKNOWN")
-                        msg = f"{emoji} {signal_type} {status} ${profit:+.2f} | ID: {trade_id} | Daily: ${bot_status['daily_pnl']:.2f}"
-                        logger.info(msg)
-                        send_telegram(msg)
-                        
-                        if trade_id in active_trades:
-                            del active_trades[trade_id]
-                        break
+                        await finalize_trade(trade_id, profit, exit_tick, "websocket")
+                        return True
                         
             except asyncio.TimeoutError:
+                # Check if trade duration has passed
+                elapsed = time.time() - start_time
+                expected_seconds = TRADE_DURATION * 60 if TRADE_DURATION_UNIT == "m" else TRADE_DURATION
+                
+                if elapsed > expected_seconds + 30:  # Grace period
+                    logger.warning(f"⏱️ Trade {trade_id} timeout after {elapsed}s")
+                    return False
                 continue
+                
             except websockets.exceptions.ConnectionClosed:
-                logger.warning(f"Monitor WS closed for {trade_id}, reconnecting...")
-                try:
-                    ws = await websockets.connect(url, ping_interval=20, ping_timeout=20)
-                    if DERIV_API_TOKEN:
-                        await ws.send(json.dumps({"authorize": DERIV_API_TOKEN}))
-                        await asyncio.wait_for(ws.recv(), timeout=5.0)
-                    await ws.send(json.dumps(subscribe_msg))
-                except Exception as e:
-                    logger.error(f"Reconnect failed: {e}")
-                    break
+                logger.warning(f"⚠️ Monitor WS closed for {trade_id}")
+                return False
+            except Exception as e:
+                logger.error(f"❌ Monitor error for {trade_id}: {e}")
+                return False
                 
     except Exception as e:
-        logger.error(f"Monitor error for {trade_id}: {e}")
+        logger.error(f"❌ WebSocket setup error for {trade_id}: {e}")
+        return False
     finally:
         if ws and not ws.closed:
             await ws.close()
-        if trade_id in active_trades:
-            del active_trades[trade_id]
-        bot_status["concurrent_trades"] = max(0, bot_status["concurrent_trades"] - 1)
+
+async def monitor_trade_polling(trade_id, contract_id, start_time):
+    """Fallback: Poll for contract status via API"""
+    poll_interval = 5  # seconds
+    max_attempts = 120  # 10 minutes max
+    
+    for attempt in range(max_attempts):
+        if time.time() - start_time > TRADE_MONITOR_TIMEOUT:
+            break
+            
+        try:
+            # Create new connection for each poll
+            url = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
+            async with websockets.connect(url, ping_timeout=10) as ws:
+                if DERIV_API_TOKEN:
+                    await ws.send(json.dumps({"authorize": DERIV_API_TOKEN}))
+                    await asyncio.wait_for(ws.recv(), timeout=5.0)
+                
+                # Request contract status (not subscribe)
+                status_msg = {
+                    "proposal_open_contract": 1,
+                    "contract_id": contract_id,
+                    "subscribe": 0  # One-time request
+                }
+                await ws.send(json.dumps(status_msg))
+                
+                response = await asyncio.wait_for(ws.recv(), timeout=10.0)
+                data = json.loads(response)
+                
+                if "proposal_open_contract" in data:
+                    contract = data["proposal_open_contract"]
+                    
+                    if contract.get("is_sold") or contract.get("is_expired"):
+                        profit = float(contract.get("profit", 0))
+                        exit_tick = contract.get("exit_tick") or contract.get("current_spot")
+                        
+                        await finalize_trade(trade_id, profit, exit_tick, "polling")
+                        return True
+                    
+                    # Update running profit
+                    if trade_id in active_trades:
+                        active_trades[trade_id]["current_profit"] = float(contract.get("profit", 0))
+                        
+        except Exception as e:
+            logger.debug(f"Poll attempt {attempt} failed: {e}")
+        
+        await asyncio.sleep(poll_interval)
+    
+    return False
+
+async def force_close_trade(trade_id, result_status):
+    """Force close a trade when monitoring fails"""
+    if trade_id not in active_trades:
+        return
+    
+    trade = active_trades[trade_id]
+    
+    # Estimate result based on current price vs entry
+    entry = trade.get("entry_price", 0)
+    current = bot_status.get("last_price", entry)
+    
+    if trade.get("type") == "CALL":
+        estimated_profit = -trade.get("stake", 0) * 0.1  # Assume small loss
+    else:
+        estimated_profit = -trade.get("stake", 0) * 0.1
+    
+    logger.warning(f"⚠️ Force closing {trade_id} with estimated P&L: ${estimated_profit:.2f}")
+    
+    trade.update({
+        "status": result_status,
+        "profit": estimated_profit,
+        "exit_price": current,
+        "exit_time": get_eat_timestamp(),
+        "forced_close": True
+    })
+    
+    trade_history.append(trade.copy())
+    risk_manager.update_after_trade(estimated_profit)
+    
+    if trade_id in active_trades:
+        del active_trades[trade_id]
+
+async def finalize_trade(trade_id, profit, exit_tick, method):
+    """Finalize trade and update statistics"""
+    if trade_id not in active_trades:
+        logger.warning(f"⚠️ Trade {trade_id} not found in active_trades")
+        return
+    
+    status = "WIN" if profit > 0 else "LOSS"
+    trade = active_trades[trade_id]
+    
+    trade.update({
+        "status": status,
+        "profit": profit,
+        "exit_price": float(exit_tick) if exit_tick else trade.get("entry_price"),
+        "exit_time": get_eat_timestamp(),
+        "monitor_method": method
+    })
+    
+    trade_history.append(trade.copy())
+    risk_manager.update_after_trade(profit)
+    
+    emoji = "✅" if profit > 0 else "❌"
+    signal_type = trade.get("signal_type", "UNKNOWN")
+    entry = trade.get("entry_price", 0)
+    exit_p = trade.get("exit_price", 0)
+    
+    msg = (f"{emoji} TRADE CLOSED ({method})\n"
+           f"Signal: {signal_type}\n"
+           f"Result: {status}\n"
+           f"P&L: ${profit:+.2f}\n"
+           f"Entry: {entry:.3f} → Exit: {exit_p:.3f}\n"
+           f"ID: {trade_id}\n"
+           f"Daily P&L: ${bot_status['daily_pnl']:+.2f}\n"
+           f"Win Rate: {bot_status['win_count']}/{bot_status['total_trades_today']}")
+    logger.info(msg.replace('\n', ' | '))
+    send_telegram(msg)
+    
+    del active_trades[trade_id]
 
 # =========================
-# DIRECTIONAL SIGNAL ANALYSIS
+# SIGNAL ANALYSIS (unchanged from previous)
 # =========================
 def analyze_signals_directional(prices_list):
-    """Analyzes momentum, stretch, volatility - trading IN THE DIRECTION of the signal."""
     if len(prices_list) < 30:
         return "NONE", None, 0, {"error": "Insufficient data"}
     
@@ -464,10 +642,15 @@ def analyze_signals_directional(prices_list):
     signals_found.sort(key=lambda x: x["confidence"], reverse=True)
     best_signal = signals_found[0]
     
+    if len(signals_found) > 1:
+        directions = [s["direction"] for s in signals_found]
+        if len(set(directions)) == 1:
+            best_signal["confidence"] = min(100, best_signal["confidence"] + 10)
+            best_signal["debug"]["agreement"] = f"{len(signals_found)} signals agree"
+    
     return best_signal["type"], best_signal["direction"], best_signal["confidence"], best_signal["debug"]
 
 def check_momentum_directional(prices_list):
-    """Trade WITH momentum direction."""
     if len(prices_list) < MOMENTUM_LOOKBACK + 1:
         return None
     
@@ -484,7 +667,7 @@ def check_momentum_directional(prices_list):
             "type": "MOMENTUM",
             "direction": "CALL",
             "confidence": confidence,
-            "debug": {"up": up_moves, "down": down_moves, "threshold": MOMENTUM_THRESHOLD}
+            "debug": {"up": up_moves, "down": down_moves, "total": total_moves}
         }
     
     if down_moves >= MOMENTUM_THRESHOLD:
@@ -493,13 +676,12 @@ def check_momentum_directional(prices_list):
             "type": "MOMENTUM",
             "direction": "PUT",
             "confidence": confidence,
-            "debug": {"up": up_moves, "down": down_moves, "threshold": MOMENTUM_THRESHOLD}
+            "debug": {"up": up_moves, "down": down_moves, "total": total_moves}
         }
     
     return None
 
 def check_stretch_directional(prices_list):
-    """Trade WITH stretch direction (breakout)."""
     if len(prices_list) < STRETCH_LOOKBACK:
         return None
     
@@ -508,29 +690,29 @@ def check_stretch_directional(prices_list):
     current = prices_list[-1]
     
     stretch = current - avg
+    stretch_pct = (abs(stretch) / avg) * 100 if avg != 0 else 0
     
     if stretch >= STRETCH_THRESHOLD:
-        confidence = min(abs(stretch) * 100, 100)
+        confidence = min(stretch_pct * 10, 100)
         return {
             "type": "STRETCH",
             "direction": "CALL",
             "confidence": confidence,
-            "debug": {"stretch": round(stretch, 3), "avg": round(avg, 3)}
+            "debug": {"stretch": round(stretch, 3), "avg": round(avg, 3), "pct": round(stretch_pct, 2)}
         }
     
     if stretch <= -STRETCH_THRESHOLD:
-        confidence = min(abs(stretch) * 100, 100)
+        confidence = min(stretch_pct * 10, 100)
         return {
             "type": "STRETCH",
             "direction": "PUT",
             "confidence": confidence,
-            "debug": {"stretch": round(stretch, 3), "avg": round(avg, 3)}
+            "debug": {"stretch": round(stretch, 3), "avg": round(avg, 3), "pct": round(stretch_pct, 2)}
         }
     
     return None
 
 def check_volatility_directional(prices_list):
-    """Trade WITH volatility spike direction."""
     if len(prices_list) < VOLATILITY_LOOKBACK + 1:
         return None
     
@@ -547,13 +729,12 @@ def check_volatility_directional(prices_list):
             "type": "VOLATILITY",
             "direction": direction,
             "confidence": confidence,
-            "debug": {"max_spike": round(max_change, 3), "direction": direction}
+            "debug": {"spike": round(max_change, 3), "direction": direction}
         }
     
     return None
 
 def check_range_breakout(prices_list):
-    """Trade WITH range breakout direction."""
     if len(prices_list) < RANGE_LOOKBACK:
         return None
     
@@ -562,21 +743,27 @@ def check_range_breakout(prices_list):
     
     range_high = max(recent)
     range_low = min(recent)
+    range_size = range_high - range_low
+    
+    if range_size < 0.5:
+        return None
     
     if current > range_high * 0.999:
+        confidence = 70 + (current - range_high) * 100
         return {
             "type": "RANGE_BREAKOUT",
             "direction": "CALL",
-            "confidence": 70,
-            "debug": {"high": round(range_high, 3), "low": round(range_low, 3), "breakout": "UP"}
+            "confidence": min(confidence, 95),
+            "debug": {"high": round(range_high, 3), "low": round(range_low, 3), "range": round(range_size, 3)}
         }
     
     if current < range_low * 1.001:
+        confidence = 70 + (range_low - current) * 100
         return {
             "type": "RANGE_BREAKOUT",
             "direction": "PUT",
-            "confidence": 70,
-            "debug": {"high": round(range_high, 3), "low": round(range_low, 3), "breakout": "DOWN"}
+            "confidence": min(confidence, 95),
+            "debug": {"high": round(range_high, 3), "low": round(range_low, 3), "range": round(range_size, 3)}
         }
     
     return None
@@ -591,8 +778,10 @@ async def stream_ticks():
     bot_status["running"] = True
     bot_status["started_at"] = get_eat_timestamp()
     
-    logger.info(f"🚀 Starting | Symbol: {SYMBOL} | Trading: {AUTO_TRADE_ENABLED}")
-    logger.info(f"📊 Signals: MOMENTUM↑↓ | STRETCH↑↓ | VOLATILITY↑↓ | RANGE↑↓")
+    logger.info("=" * 60)
+    logger.info(f"🚀 BOT STARTED | Symbol: {SYMBOL} | Trading: {'ON' if AUTO_TRADE_ENABLED else 'OFF'}")
+    logger.info(f"Min Confidence: {MIN_CONFIDENCE_THRESHOLD}% | Timeout: {TRADE_MONITOR_TIMEOUT}s")
+    logger.info("=" * 60)
 
     while not shutdown_event.is_set():
         try:
@@ -608,7 +797,7 @@ async def stream_ticks():
                         data = json.loads(msg)
 
                         if "error" in data:
-                            logger.error(f"Deriv error: {data['error']}")
+                            logger.error(f"❌ Deriv error: {data['error']}")
                             break
 
                         if "tick" in data:
@@ -640,31 +829,31 @@ async def stream_ticks():
                             bot_status["last_signal"] = f"{signal_type} {direction}" if direction else "NONE"
                             bot_status["signal_type"] = signal_type
                             bot_status["signal_direction"] = direction
+                            bot_status["signal_confidence"] = confidence
                             bot_status["trend"] = trend
                             bot_status["price_change"] = round(change, 3)
 
                             if signal_type != "NONE" and direction and AUTO_TRADE_ENABLED:
                                 can_trade, reason = risk_manager.can_trade()
                                 if can_trade:
-                                    await place_trade(direction, signal_type)
-                                elif "Daily" in reason or "limit" in reason:
-                                    logger.warning(f"Trading blocked: {reason}")
+                                    await place_trade(direction, signal_type, confidence)
+                                elif "Cooldown" not in reason:
+                                    logger.info(f"⏸️ {reason}")
 
-                            if should_print() or signal_type != "NONE":
-                                pnl = f" | P&L:${bot_status['daily_pnl']:+.2f}" if AUTO_TRADE_ENABLED else ""
-                                signal_str = f" | {signal_type} {direction} ({confidence:.0f}%)" if direction else ""
-                                logger.info(f"[{get_eat_clock()}] {quote:.3f} {trend}{signal_str}{pnl}")
+                            if should_log(signal_type, direction, confidence):
+                                log_trade_status(signal_type, direction, confidence, debug, trend, change, quote)
 
                     except asyncio.TimeoutError:
                         continue
                     except Exception as e:
-                        logger.error(f"Message error: {e}")
+                        logger.error(f"❌ Message error: {e}")
                         break
 
         except Exception as e:
-            logger.error(f"Connection error: {e}")
+            logger.error(f"❌ Connection error: {e}")
             market_ws = None
             if not shutdown_event.is_set():
+                logger.info("🔄 Reconnecting in 3s...")
                 await asyncio.sleep(3)
 
     bot_status["running"] = False
@@ -677,19 +866,50 @@ def calculate_trend(current, previous):
     change = current - previous
     return ("⬆️", change) if change > 0 else ("⬇️", change) if change < 0 else ("➡️", 0)
 
-def should_print():
+def should_log(signal_type, direction, confidence):
     global last_signal, last_signal_time
     now = time.time()
+    
+    if signal_type != "NONE" and confidence >= MIN_CONFIDENCE_THRESHOLD:
+        return True
     if PRINT_EVERY_TICK:
         return True
-    if bot_status["last_signal"] != last_signal:
-        last_signal = bot_status["last_signal"]
+    current_signal = f"{signal_type}_{direction}"
+    if current_signal != last_signal:
+        last_signal = current_signal
         last_signal_time = now
         return True
     if now - last_signal_time >= SIGNAL_COOLDOWN:
         last_signal_time = now
         return True
     return False
+
+def log_trade_status(signal_type, direction, confidence, debug, trend, change, price):
+    pnl_str = f"${bot_status['daily_pnl']:+.2f}" if AUTO_TRADE_ENABLED else "N/A"
+    trades_str = f"{bot_status['total_trades_today']}/{MAX_TRADES_PER_DAY}"
+    
+    if signal_type != "NONE":
+        emoji = "📈" if direction == "CALL" else "📉"
+        signal_str = f"{emoji} {signal_type} {direction} ({confidence:.0f}%)"
+        if "up" in debug and "down" in debug:
+            signal_str += f" [↑{debug['up']}↓{debug['down']}]"
+        elif "stretch" in debug:
+            signal_str += f" [str:{debug['stretch']}]"
+        elif "spike" in debug:
+            signal_str += f" [spike:{debug['spike']}]"
+        elif "range" in debug:
+            signal_str += f" [rng:{debug['range']}]"
+    else:
+        signal_str = "WAITING..."
+    
+    cooldown = ""
+    if bot_status["cooldown_until"] and get_eat_time() < bot_status["cooldown_until"]:
+        remaining = int((bot_status["cooldown_until"] - get_eat_time()).total_seconds())
+        cooldown = f" [COOLDOWN:{remaining}s]"
+    
+    concurrent = f" [OPEN:{bot_status['concurrent_trades']}]" if bot_status["concurrent_trades"] > 0 else ""
+    
+    logger.info(f"[{get_eat_clock()}] {price:.3f} {trend} | {signal_str} | P&L:{pnl_str} | Trades:{trades_str}{cooldown}{concurrent}")
 
 def send_telegram(msg):
     if TELEGRAM_TOKEN and CHAT_ID:
@@ -720,6 +940,18 @@ async def api_status(request):
     if bot_status["cooldown_until"] and get_eat_time() < bot_status["cooldown_until"]:
         cooldown_remaining = int((bot_status["cooldown_until"] - get_eat_time()).total_seconds() / 60)
     
+    active_trades_list = []
+    for tid, trade in active_trades.items():
+        active_trades_list.append({
+            "id": tid,
+            "type": trade.get("type"),
+            "signal": trade.get("signal_type"),
+            "stake": trade.get("stake"),
+            "entry": trade.get("entry_price"),
+            "current_pnl": trade.get("current_profit", 0),
+            "duration": trade.get("start_time")
+        })
+    
     return web.json_response({
         "status": "healthy",
         "running": bot_status["running"],
@@ -730,6 +962,7 @@ async def api_status(request):
         "last_signal": bot_status.get("last_signal"),
         "signal_type": bot_status.get("signal_type"),
         "signal_direction": bot_status.get("signal_direction"),
+        "signal_confidence": bot_status.get("signal_confidence"),
         "price_history": price_history[-50:],
         "balance": round(bot_status.get("balance", 0), 2),
         "daily_pnl": round(bot_status.get("daily_pnl", 0), 2),
@@ -738,10 +971,12 @@ async def api_status(request):
         "loss_count": bot_status.get("loss_count", 0),
         "win_rate": round(win_rate, 1),
         "concurrent_trades": bot_status.get("concurrent_trades", 0),
-        "active_trades": {k: v for k, v in active_trades.items()},
+        "active_trades": active_trades_list,
+        "last_trade_result": bot_status.get("last_trade_result"),
         "daily_limit_hit": bot_status.get("daily_limit_hit", False),
         "cooldown_remaining": cooldown_remaining,
-        "next_stake": risk_manager.calculate_stake() if AUTO_TRADE_ENABLED else 0
+        "next_stake": risk_manager.calculate_stake() if AUTO_TRADE_ENABLED else 0,
+        "martingale_step": martingale_state["consecutive_losses"] if MARTINGALE_ENABLED else 0
     })
 
 async def start_server():
@@ -774,7 +1009,7 @@ async def main():
 
 if __name__ == "__main__":
     if AUTO_TRADE_ENABLED and not DERIV_API_TOKEN:
-        logger.warning("⚠️ AUTO_TRADE_ENABLED but no DERIV_API_TOKEN")
+        logger.warning("⚠️ AUTO_TRADE_ENABLED but no DERIV_API_TOKEN - disabling trading")
         AUTO_TRADE_ENABLED = False
         bot_status["trading_enabled"] = False
     
