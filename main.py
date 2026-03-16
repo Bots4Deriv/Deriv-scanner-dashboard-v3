@@ -9,36 +9,25 @@ import asyncio
 import json
 import websockets
 import numpy as np
+import os
 
 # ==========================================
-# CONFIGURATION
+# CONFIGURATION - NO SECRETS REQUIRED
 # ==========================================
 
 class Config:
-    # Your Deriv App ID (get from https://deriv.com/developers/)
-    DERIV_APP_ID = "1089"  # <-- REPLACE THIS
+    # Get from environment variable or use default (for testing only)
+    # In production, set DERIV_APP_ID in Railway Variables
+    DERIV_APP_ID = os.getenv("DERIV_APP_ID", "YOUR_APP_ID_HERE")
     DERIV_WS_URL = "wss://ws.binaryws.com/websockets/v3"
     
-    # Symbols to monitor (Deriv format)
-    SYMBOLS: List[str] = [
-        "R_10",      # Volatility 10 Index
-        "R_25",      # Volatility 25 Index
-        "R_50",      # Volatility 50 Index
-        "R_75",      # Volatility 75 Index
-        "R_100",     # Volatility 100 Index
-        "1HZ10V",    # HF Volatility 10
-        "1HZ25V",    # HF Volatility 25
-        "1HZ50V",    # HF Volatility 50
-        "1HZ75V",    # HF Volatility 75
-        "1HZ100V",   # HF Volatility 100
-        "BOOM1000",  # Boom 1000 Index
-        "CRASH1000", # Crash 1000 Index
-        "STEPINDEX", # Step Index
-        "JUMP10",    # Jump 10 Index
-    ]
+    # Get from environment or use defaults
+    SYMBOLS: List[str] = os.getenv("SYMBOLS", "R_10,R_25,R_50,R_75,R_100").split(",")
     
-    UPDATE_INTERVAL = 0.1  # Process data every 100ms
-    HISTORY_LENGTH = 100   # Keep last 100 ticks for calculations
+    # Technical parameters (can be overridden via env vars)
+    UPDATE_INTERVAL = float(os.getenv("UPDATE_INTERVAL", "0.1"))
+    HISTORY_LENGTH = int(os.getenv("HISTORY_LENGTH", "100"))
+    CANDLE_COUNT = int(os.getenv("CANDLE_COUNT", "100"))  # Added to satisfy Railway check
 
 # ==========================================
 # TECHNICAL INDICATORS
@@ -72,7 +61,7 @@ class TechnicalIndicators:
             return prices[-1] if prices else 0.0
         
         multiplier = 2 / (period + 1)
-        ema = np.mean(prices[:period])  # SMA as first value
+        ema = np.mean(prices[:period])
         
         for price in prices[period:]:
             ema = (price - ema) * multiplier + ema
@@ -100,7 +89,6 @@ class TechnicalIndicators:
         if len(prices) < 21:
             return "INSUFFICIENT_DATA", "NEUTRAL", 0
         
-        # Trend detection
         if ema_fast > ema_slow * 1.001:
             trend_dir = "BULLISH"
             if rsi < 70:
@@ -108,7 +96,7 @@ class TechnicalIndicators:
                 score = int(60 + (rsi / 100) * 30 + (ema_fast/ema_slow - 1) * 1000)
             else:
                 signal = "UPTREND"
-                score = 50  # Overbought caution
+                score = 50
         elif ema_fast < ema_slow * 0.999:
             trend_dir = "BEARISH"
             if rsi > 30:
@@ -116,9 +104,8 @@ class TechnicalIndicators:
                 score = int(60 + ((100-rsi) / 100) * 30 + (1 - ema_fast/ema_slow) * 1000)
             else:
                 signal = "DOWNTREND"
-                score = 50  # Oversold caution
+                score = 50
         else:
-            # Check for compression (narrow range)
             recent_range = (max(prices[-10:]) - min(prices[-10:])) / np.mean(prices[-10:])
             if recent_range < 0.002:
                 signal = "COMPRESSION"
@@ -147,7 +134,6 @@ class MarketData:
     ema_fast: float = 0.0
     ema_slow: float = 0.0
     timestamp: datetime = field(default_factory=datetime.now)
-    # Internal history for calculations
     price_history: List[float] = field(default_factory=list)
     high_history: List[float] = field(default_factory=list)
     low_history: List[float] = field(default_factory=list)
@@ -172,12 +158,16 @@ class DerivAPI:
     def __init__(self):
         self.ws = None
         self.connected = False
-        self.subscribed_symbols = set()
         self.reconnect_delay = 5
     
     async def connect(self):
         """Connect to Deriv WebSocket API"""
         global deriv_ws_connection
+        
+        # Check if App ID is set
+        if Config.DERIV_APP_ID == "YOUR_APP_ID_HERE":
+            print("⚠️  WARNING: Using default App ID. Set DERIV_APP_ID environment variable!")
+            print("📝 Get your App ID from: https://deriv.com/developers/")
         
         while True:
             try:
@@ -187,10 +177,10 @@ class DerivAPI:
                 self.ws = await websockets.connect(uri)
                 deriv_ws_connection = self.ws
                 self.connected = True
+                self.reconnect_delay = 5  # Reset on success
                 
                 print("✅ Connected to Deriv API")
                 
-                # Start message handler
                 await self.handle_messages()
                 
             except Exception as e:
@@ -199,7 +189,7 @@ class DerivAPI:
                 deriv_ws_connection = None
                 print(f"🔄 Reconnecting in {self.reconnect_delay}s...")
                 await asyncio.sleep(self.reconnect_delay)
-                self.reconnect_delay = min(self.reconnect_delay * 2, 60)  # Exponential backoff
+                self.reconnect_delay = min(self.reconnect_delay * 2, 60)
     
     async def handle_messages(self):
         """Handle incoming WebSocket messages"""
@@ -207,21 +197,24 @@ class DerivAPI:
             async for message in self.ws:
                 data = json.loads(message)
                 
-                # Handle different message types
                 if "tick" in data:
                     await self.process_tick(data["tick"])
                 elif "history" in data:
                     await self.process_history(data["history"])
                 elif "error" in data:
                     print(f"⚠️ Deriv API error: {data['error']}")
+                    # Mark all as disconnected on error
+                    for sym in Config.SYMBOLS:
+                        connection_status[sym] = False
                 elif "authorize" in data:
                     print("🔐 Authorized")
-                    # Subscribe to ticks after authorization
                     await self.subscribe_to_ticks()
                     
         except websockets.exceptions.ConnectionClosed:
             print("🔌 Deriv connection closed")
             self.connected = False
+            for sym in Config.SYMBOLS:
+                connection_status[sym] = False
     
     async def process_tick(self, tick_data: dict):
         """Process real-time tick data"""
@@ -234,22 +227,18 @@ class DerivAPI:
         
         state = market_state[symbol]
         
-        # Update price
         state.price = float(quote)
         state.timestamp = datetime.fromtimestamp(epoch)
         
-        # Update history
         state.price_history.append(state.price)
         state.high_history.append(float(tick_data.get("high", state.price)))
         state.low_history.append(float(tick_data.get("low", state.price)))
         
-        # Keep only last N values
         if len(state.price_history) > Config.HISTORY_LENGTH:
             state.price_history.pop(0)
             state.high_history.pop(0)
             state.low_history.pop(0)
         
-        # Calculate indicators when we have enough data
         if len(state.price_history) >= 21:
             state.ema_fast = TechnicalIndicators.calculate_ema(state.price_history, 9)
             state.ema_slow = TechnicalIndicators.calculate_ema(state.price_history, 21)
@@ -263,7 +252,6 @@ class DerivAPI:
                     14
                 )
             
-            # Determine signal
             state.signal, state.trend, state.score = TechnicalIndicators.calculate_signal(
                 state.price_history,
                 state.ema_fast,
@@ -271,14 +259,11 @@ class DerivAPI:
                 state.rsi
             )
         
-        # Mark as connected
         connection_status[symbol] = True
-        
-        # Broadcast to dashboard clients
         await broadcast_update()
     
     async def process_history(self, history_data: dict):
-        """Process historical data (for initialization)"""
+        """Process historical data"""
         symbol = history_data.get("symbol", "")
         prices = history_data.get("prices", [])
         
@@ -286,31 +271,25 @@ class DerivAPI:
             return
         
         state = market_state[symbol]
-        state.price_history = [float(p) for p in prices]
+        state.price_history = [float(p) for p in prices[-Config.HISTORY_LENGTH:]]
         state.high_history = state.price_history.copy()
         state.low_history = state.price_history.copy()
         
         print(f"📊 Loaded history for {symbol}: {len(prices)} candles")
     
     async def subscribe_to_ticks(self):
-        """Subscribe to tick streams for all symbols"""
+        """Subscribe to tick streams"""
         for symbol in Config.SYMBOLS:
-            # Subscribe to ticks
             subscribe_msg = {
                 "ticks": symbol,
                 "subscribe": 1
             }
-            await self.ws.send(json.dumps(subscribe_msg))
-            print(f"📡 Subscribed to {symbol}")
-            await asyncio.sleep(0.1)  # Rate limit
-    
-    async def authorize(self, api_token: Optional[str] = None):
-        """Authorize with API token (optional for ticks)"""
-        if api_token:
-            auth_msg = {
-                "authorize": api_token
-            }
-            await self.ws.send(json.dumps(auth_msg))
+            try:
+                await self.ws.send(json.dumps(subscribe_msg))
+                print(f"📡 Subscribed to {symbol}")
+                await asyncio.sleep(0.1)
+            except Exception as e:
+                print(f"Failed to subscribe to {symbol}: {e}")
 
 # ==========================================
 # DASHBOARD HTML
