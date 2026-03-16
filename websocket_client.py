@@ -19,12 +19,14 @@ class DerivWebSocket:
         self.running = True
 
     async def connect(self):
-        url = f"wss://ws.derivws.com/websockets/v3?app_id={Config.APP_ID}"
+        # Use public demo endpoint (no API token required)
+        url = f"wss://ws.binaryws.com/websockets/v3?app_id=1089"
         while self.running:
             try:
                 async with websockets.connect(url, ping_interval=20, ping_timeout=10) as ws:
                     self.ws = ws
-                    await self._authorize()
+                    print(f"[{self.symbol}] Connected to public WebSocket")
+                    
                     await self._fetch_history()
                     await self._subscribe_ticks()
                     await self._message_loop()
@@ -32,24 +34,24 @@ class DerivWebSocket:
                 print(f"[{self.symbol}] WS error: {e}")
                 await asyncio.sleep(5)
 
-    async def _authorize(self):
-        await self.ws.send(json.dumps({"authorize": Config.API_TOKEN}))
-        resp = await self.ws.recv()
-        data = json.loads(resp)
-        if "error" in data:
-            raise Exception(data["error"])
-
     async def _fetch_history(self):
-        msg = {"ticks_history": self.symbol, "style": "candles", "granularity": Config.TIMEFRAME, "count": Config.CANDLE_COUNT}
+        msg = {
+            "ticks_history": self.symbol,
+            "style": "candles",
+            "granularity": Config.TIMEFRAME,
+            "count": Config.CANDLE_COUNT
+        }
         await self.ws.send(json.dumps(msg))
         resp = json.loads(await self.ws.recv())
         candles = resp.get("candles", [])
         self.closes = [c["close"] for c in candles]
         self.highs = [c["high"] for c in candles]
         self.lows = [c["low"] for c in candles]
+        print(f"[{self.symbol}] Loaded {len(candles)} historical candles")
 
     async def _subscribe_ticks(self):
         await self.ws.send(json.dumps({"ticks": self.symbol, "subscribe": 1}))
+        print(f"[{self.symbol}] Subscribed to live ticks")
 
     async def _message_loop(self):
         async for msg in self.ws:
@@ -57,13 +59,27 @@ class DerivWebSocket:
             if "tick" in data:
                 tick = data["tick"]
                 price = float(tick["quote"])
+                
+                # Update OHLC arrays
                 self.closes.append(price)
                 self.highs.append(price)
                 self.lows.append(price)
+                
+                # Keep max history
                 if len(self.closes) > Config.MAX_HISTORY:
                     self.closes.pop(0)
                     self.highs.pop(0)
                     self.lows.pop(0)
+                
+                # Analyze if enough data
                 if len(self.closes) >= 25:
-                    self.analyzer.analyze(self.symbol, self.closes, self.highs, self.lows, self.market_state, self.last_signals)
+                    self.analyzer.analyze(
+                        self.symbol,
+                        self.closes,
+                        self.highs,
+                        self.lows,
+                        self.market_state,
+                        self.last_signals
+                    )
+                
                 await asyncio.sleep(Config.SCAN_INTERVAL)
