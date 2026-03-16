@@ -16,7 +16,7 @@ import numpy as np
 
 class Config:
     # Your Deriv App ID (get from https://deriv.com/developers/)
-    DERIV_APP_ID = "YOUR_APP_ID_HERE"  # <-- REPLACE THIS
+    DERIV_APP_ID = "1089"  # <-- REPLACE THIS
     DERIV_WS_URL = "wss://ws.binaryws.com/websockets/v3"
     
     # Symbols to monitor (Deriv format)
